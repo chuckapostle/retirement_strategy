@@ -1,5 +1,5 @@
 """
-31 Retirement Income and Tax Planning Simulator v5
+32 Retirement Income and Tax Planning Simulator v5
 ================================================
 With accumulation phase, Monte Carlo, and Excel export.
 
@@ -802,18 +802,26 @@ def main():
                 st.success("Loaded starting_balances.txt")
             else:
                 st.info("No starting_balances.txt found; using defaults")
-            pretax_default = qp_int("pretax", file_balances["401k"] if file_balances["401k"] is not None else 1_475_000)
-            roth_default = qp_int("roth", file_balances["roth"] if file_balances["roth"] is not None else 510_000)
-            hsa_default = qp_int("hsa", file_balances["hsa"] if file_balances["hsa"] is not None else 130_000)
-            s5_default = qp_int("s5", file_balances["s_plus_5"] if file_balances["s_plus_5"] is not None else 300_000)
-            s10_default = qp_int("s10", file_balances["s_plus_10"] if file_balances["s_plus_10"] is not None else 400_000)
-            cash_default = qp_int("cash", file_balances["cash"] if file_balances["cash"] is not None else 745_000)
-            pretax = st.number_input("PreTax 401(k) ($)", 0, 10_000_000, pretax_default, step=50_000, format="%d")
-            roth_bal = st.number_input("Roth IRA ($)", 0, 5_000_000, roth_default, step=25_000, format="%d")
-            hsa_bal = st.number_input("HSA ($)", 0, 500_000, hsa_default, step=10_000, format="%d")
-            s5_bal = st.number_input("S+ 5-Year Payout ($)", 0, 2_000_000, s5_default, step=25_000, format="%d")
-            s10_bal = st.number_input("S+ 10-Year Payout ($)", 0, 2_000_000, s10_default, step=25_000, format="%d")
-            cash_bal = st.number_input("Cash ($)", 0, 1_000_000, cash_default, step=10_000, format="%d")
+            balance_specs = [
+                ("pretax_input", "pretax", file_balances["401k"] if file_balances["401k"] is not None else 1_475_000),
+                ("roth_input", "roth", file_balances["roth"] if file_balances["roth"] is not None else 510_000),
+                ("hsa_input", "hsa", file_balances["hsa"] if file_balances["hsa"] is not None else 130_000),
+                ("s5_input", "s5", file_balances["s_plus_5"] if file_balances["s_plus_5"] is not None else 300_000),
+                ("s10_input", "s10", file_balances["s_plus_10"] if file_balances["s_plus_10"] is not None else 400_000),
+                ("cash_input", "cash", file_balances["cash"] if file_balances["cash"] is not None else 745_000),
+            ]
+            for widget_key, param_name, fallback in balance_specs:
+                if param_name in st.query_params:
+                    st.session_state[widget_key] = qp_int(param_name, fallback)
+                elif widget_key not in st.session_state:
+                    st.session_state[widget_key] = fallback
+
+            pretax = st.number_input("PreTax 401(k) ($)", 0, 10_000_000, step=50_000, format="%d", key="pretax_input")
+            roth_bal = st.number_input("Roth IRA ($)", 0, 5_000_000, step=25_000, format="%d", key="roth_input")
+            hsa_bal = st.number_input("HSA ($)", 0, 500_000, step=10_000, format="%d", key="hsa_input")
+            s5_bal = st.number_input("S+ 5-Year Payout ($)", 0, 2_000_000, step=25_000, format="%d", key="s5_input")
+            s10_bal = st.number_input("S+ 10-Year Payout ($)", 0, 2_000_000, step=25_000, format="%d", key="s10_input")
+            cash_bal = st.number_input("Cash ($)", 0, 1_000_000, step=10_000, format="%d", key="cash_input")
 
         with st.expander("\U0001F4BC Working Years Contributions"):
             st.caption(f"Annual contributions for {max(0, retirement_age - current_age)} remaining working years")
