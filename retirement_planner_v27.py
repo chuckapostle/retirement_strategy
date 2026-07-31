@@ -773,6 +773,15 @@ def qp_float(name, default):
     except:
         return default
 
+def get_balance_source(file_balances):
+    qp = st.query_params
+    web_keys = ["pretax", "roth", "hsa", "s5", "s10", "cash"]
+    if any(str(qp.get(k, "")).strip() for k in web_keys):
+        return "web fetch from Excel"
+    if any(v is not None for v in file_balances.values()):
+        return "using Starting_balances.txt"
+    return "using defaults"
+
 def main():
     st.set_page_config(page_title="Retirement Income Planner", page_icon="\U0001F4CA",
                        layout="wide", initial_sidebar_state="expanded")
