@@ -1,5 +1,5 @@
 """
-Retirement Income and Tax Planning Simulator v5
+9 Retirement Income and Tax Planning Simulator v5
 ================================================
 With accumulation phase, Monte Carlo, and Excel export.
 
@@ -814,6 +814,14 @@ def main():
             s5_bal = st.number_input("S+ 5-Year Payout ($)", 0, 2_000_000, s5_default, step=25_000, format="%d")
             s10_bal = st.number_input("S+ 10-Year Payout ($)", 0, 2_000_000, s10_default, step=25_000, format="%d")
             cash_bal = st.number_input("Cash ($)", 0, 1_000_000, cash_default, step=10_000, format="%d")
+            st.write("Widget defaults:", {
+                "pretax_default": pretax_default,
+                "roth_default": roth_default,
+                "hsa_default": hsa_default,
+                "s5_default": s5_default,
+                "s10_default": s10_default,
+                "cash_default": cash_default,
+            })
 
         with st.expander("\U0001F4BC Working Years Contributions"):
             st.caption(f"Annual contributions for {max(0, retirement_age - current_age)} remaining working years")
