@@ -897,7 +897,7 @@ def main():
         with st.expander("\U0001F468\u200D\U0001F469\u200D\U0001F467\u200D\U0001F466 Legacy"):
             num_kids = st.number_input("Children", 0, 10, 4)
             roth_per_child = st.number_input("Roth/Child/Year ($)", 0, 50_000, 7_500, step=500, format="%d")
-            legacy_years = st.slider("Legacy Duration (years)", 1, 20, 10)
+            legacy_years = st.slider("Legacy Duration (years)", 1, 20, 20)
 
         with st.expander("\U0001F3DB Tax"):
             or_resident = st.checkbox("Oregon Resident", value=True)
