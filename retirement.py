@@ -1,5 +1,5 @@
 """
-32 Retirement Income and Tax Planning Simulator v5
+Retirement Income and Tax Planning Simulator v5
 ================================================
 With accumulation phase, Monte Carlo, and Excel export.
 
@@ -763,8 +763,9 @@ def export_to_excel(accum_df, retire_df, cfg):
 
 def qp_int(name, default):
     try:
-        return int(str(st.query_params.get(name, default)).replace(',', '').replace('$', '').strip())
-    except:
+        raw = str(st.query_params.get(name, default)).replace(',', '').replace('$', '').strip()
+        return int(float(raw))
+    except (TypeError, ValueError):
         return default
 
 def qp_float(name, default):
