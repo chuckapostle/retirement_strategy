@@ -1,11 +1,41 @@
 """
-Retirement Income and Tax Planning Simulator v5
+Retirement Income and Tax Planning Simulator v6
 ================================================
 With accumulation phase, Monte Carlo, and Excel export.
 
 Usage:
   pip install streamlit plotly pandas numpy openpyxl
-  streamlit run retirement_planner.py
+  streamlit run retirement_v6.py
+
+v6 correctness fixes (from a full audit of v5):
+  1. Legacy Roth gifts were being subtracted from cash TWICE (once via
+     total_exp/the draw engine, again via an explicit cash-to-Roth
+     transfer) -- fixed to a single, reconciling debit/credit.
+  2. In down-market years the model withdrew the legacy gift as an
+     "expense" but never deposited it anywhere (a phantom
+     Legacy_Inheritance figure with no real balance behind it) -- fixed
+     so the money simply stays invested and isn't withdrawn at all.
+  3. Account "depleted" flags were one-way and never reset, permanently
+     freezing growth on any account that hit zero and later recovered
+     (e.g. Roth refilled by a legacy gift) -- now evaluated live.
+  4. Negative cash was floored to $0 in Cash_EOY and Total_Liquid_Assets,
+     hiding real funding shortfalls and inflating Monte Carlo success
+     rates -- now shown/counted honestly.
+  5. Itemized deductions double-counted the non-taxable portion of JSS
+     income (already excluded from taxable income, then deducted again).
+  6. Oregon taxable income over-subtracted an extra 15% of Social
+     Security that was never part of the taxable base to begin with.
+  7. Oregon Roth-conversion tax used a flat 9% guess instead of the
+     actual marginal OREGON_BRACKETS calculation used for federal.
+  8. RMD table stopped at age 100 and silently reused the age-95 factor
+     for older ages -- extended through the IRS floor of 2.0 at 120+.
+  9. RMD was computed on the current year's already-grown balance
+     instead of the prior year-end balance (overstated RMDs slightly).
+ 10. Social Security taxability used a flat $6,000 tier-2 add-on instead
+     of the IRS-correct min($6,000, 50% of benefits) cap.
+ 11. The "performance_draw_only" cash cap always used the static average
+     return even inside Monte Carlo runs, instead of that year's actual
+     simulated return.
 """
 
 import streamlit as st
@@ -27,7 +57,16 @@ RMD_TABLE = {
     84: 16.8, 85: 16.0, 86: 15.2, 87: 14.4, 88: 13.7, 89: 12.9,
     90: 12.2, 91: 11.5, 92: 10.8, 93: 10.1, 94: 9.5, 95: 8.9,
     96: 8.4, 97: 7.8, 98: 7.3, 99: 6.8, 100: 6.4,
+    # Table previously stopped at 100 and silently fell back to the age-95
+    # factor (8.9) for any older age, understating RMDs for anyone whose
+    # planning horizon runs past 100. Full IRS Pub. 590-B Uniform Lifetime
+    # Table (Appendix B, Table III) continues to a floor of 2.0 at 120+.
+    101: 6.0, 102: 5.6, 103: 5.2, 104: 4.9, 105: 4.6, 106: 4.3,
+    107: 4.1, 108: 3.9, 109: 3.7, 110: 3.5, 111: 3.4, 112: 3.3,
+    113: 3.1, 114: 3.0, 115: 2.9, 116: 2.8, 117: 2.7, 118: 2.5,
+    119: 2.3, 120: 2.0,
 }
+RMD_TABLE_FLOOR_FACTOR = 2.0  # "120 and older" per the IRS table
 IRMAA_MAGI_THRESHOLD = 206_000
 IRMAA_MONTHLY_SURCHARGE = 230.80
 FEDERAL_BRACKETS = [
@@ -65,11 +104,21 @@ def ss_taxable_portion(ss, other):
     prov = other + ss * 0.5
     if prov < 32_000: return 0.0
     elif prov < 44_000: return min(ss * 0.5, (prov - 32_000) * 0.5)
-    else: return min(ss * 0.85, 6_000 + (prov - 44_000) * 0.85)
+    else:
+        # IRS worksheet caps the tier-2 add-on at min($6,000, 50% of SS
+        # benefits) — a flat $6,000 overstates taxable SS whenever benefits
+        # are under ~$12k/yr (0.5*ss < 6000).
+        tier2_addon = min(6_000, ss * 0.5)
+        return min(ss * 0.85, tier2_addon + (prov - 44_000) * 0.85)
 
 def get_rmd(bal, age, start):
     if age < start or bal <= 0: return 0.0
-    f = RMD_TABLE.get(age, 8.9)
+    if age in RMD_TABLE:
+        f = RMD_TABLE[age]
+    elif age > max(RMD_TABLE):
+        f = RMD_TABLE_FLOOR_FACTOR  # IRS table floors at 2.0 for 120+
+    else:
+        f = RMD_TABLE[min(RMD_TABLE)]  # shouldn't happen given the age < start guard above
     return bal / f if f > 0 else 0.0
 
 def generate_returns(target, std, mx, n, rng):
@@ -230,8 +279,12 @@ def run_simulation(cfg, return_overrides=None):
     pr_hs = cfg["hsa_return"]
     pr_ca = cfg["cash_return"]
 
-    cum_gifts, cum_legacy_roth, cum_lump_sums = 0.0, 0.0, 0.0
-    pt_depleted = ro_depleted = hs_depleted = ca_depleted = False
+    cum_gifts, cum_legacy_roth, cum_legacy_inheritance, cum_lump_sums = 0.0, 0.0, 0.0, 0.0
+    CASH_DISTRESS_FLOOR = -50_000  # below this, we stop accruing "growth" on a cash deficit
+    legacy_pool = 0.0  # money already gifted into the kids' Roth accounts -- legally
+    # theirs, not the household's. Kept segregated from `ro` (the parents' own
+    # Roth) so it (a) compounds on its own and can be charted, and (b) can
+    # never be drawn back out by the household's own retirement withdrawals.
 
     for idx in range(num_years):
         age = ret_age + idx
@@ -242,16 +295,29 @@ def run_simulation(cfg, return_overrides=None):
         row = {"Phase": "Retirement", "Age": age, "Year": yr, "Years_Retired": yir}
 
         # ── GROWTH ──
+        # "Depleted" is now evaluated live off the current balance every year,
+        # instead of a one-way flag that, once set, permanently froze growth
+        # even after a balance recovered (e.g. a Roth that hit zero and was
+        # later refilled by a legacy contribution or Roth conversion never
+        # used to earn interest again under the old logic).
+        if return_overrides:
+            r_pt, r_ro = return_overrides["pretax"][yir], return_overrides["roth"][yir]
+            r_hs, r_ca = return_overrides["hsa"][yir], return_overrides["cash"][yir]
+        else:
+            r_pt, r_ro, r_hs, r_ca = pr_pt, pr_ro, pr_hs, pr_ca
+
+        # Snapshot the pretax balance as of the *prior* year-end, before this
+        # year's growth is applied — RMDs are legally based on the 12/31
+        # balance from the year before, not a balance that already includes
+        # this year's market movement.
+        pt_prior_year_end = pt
+
         if yir > 0:
-            if return_overrides:
-                r_pt, r_ro = return_overrides["pretax"][yir], return_overrides["roth"][yir]
-                r_hs, r_ca = return_overrides["hsa"][yir], return_overrides["cash"][yir]
-            else:
-                r_pt, r_ro, r_hs, r_ca = pr_pt, pr_ro, pr_hs, pr_ca
-            if not pt_depleted: pt *= (1 + r_pt)
-            if not ro_depleted: ro *= (1 + r_ro)
-            if not hs_depleted: hs *= (1 + r_hs)
-            if not ca_depleted: ca *= (1 + r_ca)
+            if pt > 0: pt *= (1 + r_pt)
+            if ro > 0: ro *= (1 + r_ro)
+            if hs > 0: hs *= (1 + r_hs)
+            if ca > CASH_DISTRESS_FLOOR: ca *= (1 + r_ca)
+            if legacy_pool > 0: legacy_pool *= (1 + r_ro)
             row["Return_PreTax"], row["Return_Roth"] = r_pt, r_ro
             row["Return_HSA"], row["Return_Cash"] = r_hs, r_ca
         else:
@@ -288,12 +354,15 @@ def run_simulation(cfg, return_overrides=None):
         hdhp = cfg["hdhp_annual"] * (1 + infl) ** yir if age < 65 else 0.0
         gifts = cfg["gifts_annual"] * (1 + infl) ** yir
         lump = cfg.get("lump_sums", {}).get(age, 0.0)
-        roth_leg = 0.0
-        if yir < cfg.get("legacy_years", 10):
-            roth_leg = cfg["num_children"] * cfg["roth_legacy_per_child"] * (1 + cfg["legacy_inflation"]) ** yir
-        total_exp = base_exp + healthcare + hdhp + gifts + lump + roth_leg
+        legacy_target_per_child = 0.0
+        legacy_target_total = 0.0
+        if yir < cfg.get("legacy_years", 10) and cfg.get("num_children", 0) > 0:
+            legacy_target_per_child = cfg["roth_legacy_per_child"] * (1 + cfg["legacy_inflation"]) ** yir
+            legacy_target_total = cfg["num_children"] * legacy_target_per_child
 
         # ── DISCRETIONARY REDUCTION ON NEGATIVE RETURN ──
+        # Moved ahead of total_exp (was after) so the legacy-funding decision
+        # right below can use it.
         # Use pretax return as proxy for overall market return in that year
         is_negative_return = False
         if return_overrides and yir < len(return_overrides["pretax"]):
@@ -301,6 +370,18 @@ def run_simulation(cfg, return_overrides=None):
                 is_negative_return = True
         elif cfg["pretax_return"] < 0:
             is_negative_return = True
+
+        # Only fund the legacy gift out of this year's cash flow when it will
+        # actually be deposited into Roth below (i.e. not a down-market year).
+        # Previously legacy_target_total was added to total_exp
+        # *unconditionally*, so the draw engine withdrew it from real accounts
+        # as "spending" even in years the code elsewhere skipped the actual
+        # Roth gift -- the money vanished without ever landing anywhere.
+        # Skipping it here means it simply stays invested and becomes
+        # ordinary inheritance later (tracked below, not a separate pot).
+        legacy_funding_this_year = legacy_target_total if (legacy_target_total > 0 and not is_negative_return) else 0.0
+
+        total_exp = base_exp + healthcare + hdhp + gifts + lump + legacy_funding_this_year
 
         if is_negative_return:
             reduction = cfg.get("neg_ret_draw_reduction", 0.0)
@@ -312,13 +393,15 @@ def run_simulation(cfg, return_overrides=None):
             row["Discretionary_Reduction"] = 0.0
 
         row["Base_Expenses"], row["Healthcare_Cost"], row["HDHP"] = base_exp, healthcare, hdhp
-        row["Gifts"], row["Lump_Sum"], row["Legacy_Roth"] = gifts, lump, roth_leg
+        row["Gifts"], row["Lump_Sum"], row["Legacy_Roth"] = gifts, lump, legacy_funding_this_year
+        row["Legacy_Target_Per_Child"] = legacy_target_per_child
+        row["Legacy_Target_Total"] = legacy_target_total
         row["Total_Expenses"] = total_exp
 
         passive = sp_inc + jss_inc + ss_inc + rent_inc
         row["Passive_Income"] = passive
 
-        rmd = get_rmd(pt, age, cfg["rmd_start_age"])
+        rmd = get_rmd(pt_prior_year_end, age, cfg["rmd_start_age"])
         row["RMD"] = rmd
 
         # ── BRACKET-OPTIMIZED DRAW STRATEGY ──
@@ -333,25 +416,28 @@ def run_simulation(cfg, return_overrides=None):
         is_rmd_phase = age >= cfg["rmd_start_age"]
 
         if is_rmd_phase:
-            if not pt_depleted: ptd = min(rmd, pt); need = max(0.0, need - ptd)
-            if need > 0 and not ca_depleted and ca > 0: d = min(need, ca); cad += d; need -= d
-            if need > 0 and not ro_depleted and ro > 0: d = min(need, ro); rod += d; need -= d
-            if need > 0 and not hs_depleted and hs > 0: d = min(need, hs); hsd += d; need -= d
+            if pt > 0: ptd = min(rmd, pt); need = max(0.0, need - ptd)
+            if need > 0 and ca > 0: d = min(need, ca); cad += d; need -= d
+            if need > 0 and ro > 0: d = min(need, ro); rod += d; need -= d
+            if need > 0 and hs > 0: d = min(need, hs); hsd += d; need -= d
             row["Draw_Strategy"] = "RMD-Dominated"
         else:
-            if need > 0 and not pt_depleted and pt > 0:
+            if need > 0 and pt > 0:
                 d = min(need, pretax_room_12, pt); ptd += d; need -= d
-            if need > 0 and not ca_depleted and ca > 0:
-                mx = ca * pr_ca if cfg["performance_draw_only"] else ca
-                d = min(need, mx); cad += d; need -= d
-            if need > 0 and not ro_depleted and ro > 0: d = min(need, ro); rod += d; need -= d
-            if need > 0 and not hs_depleted and hs > 0: d = min(need, hs); hsd += d; need -= d
+            if need > 0 and ca > 0:
+                # Was always cfg's static average cash return (pr_ca), even
+                # inside Monte Carlo runs where the realized draw for this
+                # specific year is r_ca -- now uses the actual realized return.
+                mx = ca * r_ca if cfg["performance_draw_only"] else ca
+                d = min(need, max(0.0, mx)); cad += d; need -= d
+            if need > 0 and ro > 0: d = min(need, ro); rod += d; need -= d
+            if need > 0 and hs > 0: d = min(need, hs); hsd += d; need -= d
             row["Draw_Strategy"] = "Bracket-Optimized"
 
         if need > 0:
-            for nm, avail, dep in [("pretax", pt-ptd, pt_depleted), ("cash", ca-cad, ca_depleted),
-                                   ("roth", ro-rod, ro_depleted), ("hsa", hs-hsd, hs_depleted)]:
-                if need <= 0 or dep: continue
+            for nm, avail in [("pretax", pt-ptd), ("cash", ca-cad),
+                               ("roth", ro-rod), ("hsa", hs-hsd)]:
+                if need <= 0: continue
                 d = min(need, max(0.0, avail))
                 if nm == "pretax": ptd += d
                 elif nm == "cash": cad += d
@@ -369,11 +455,21 @@ def run_simulation(cfg, return_overrides=None):
         gross_taxable = other_taxable + sst
         std_ded = cfg["standard_deduction"] * (1 + binfl) ** yfb
         med_ded = max(0.0, healthcare - 0.075 * gross_taxable)
-        item_ded = med_ded + hdhp + (jss_inc - jss_tax)
+        # NOTE: the non-taxable portion of JSS income (jss_inc - jss_tax) was
+        # previously added here too. That income was never included in
+        # gross_taxable to begin with (other_taxable only adds jss_tax), so
+        # deducting it again created a phantom deduction that understated tax
+        # every year JSS was partially or fully non-taxable.
+        item_ded = med_ded + hdhp
         best_ded = max(std_ded, item_ded)
         fed_taxable = max(0.0, gross_taxable - best_ded)
         fed_tax = calc_tax(fed_taxable, FEDERAL_BRACKETS, yfb, binfl)
-        or_taxable = max(0.0, gross_taxable - sst - ss_inc * 0.15 - best_ded)
+        # Oregon fully exempts Social Security. The only SS-related dollars
+        # ever present in gross_taxable are `sst` (other_taxable has no raw
+        # ss_inc term), so subtracting `sst` alone fully backs SS out of the
+        # Oregon base. The old formula also subtracted an extra ss_inc*0.15
+        # that was never part of gross_taxable, understating Oregon tax.
+        or_taxable = max(0.0, gross_taxable - sst - best_ded)
         or_tax = calc_tax(or_taxable, OREGON_BRACKETS, yfb, binfl) if cfg["oregon_resident"] else 0.0
         total_tax = fed_tax + or_tax
 
@@ -402,7 +498,13 @@ def run_simulation(cfg, return_overrides=None):
             roth_conv_amt = min(conv_room, max(0.0, pt - ptd - cfg["roth_conversion_margin"]))
             if roth_conv_amt > 0:
                 fc = calc_tax(fed_taxable + roth_conv_amt, FEDERAL_BRACKETS, yfb, binfl) - fed_tax
-                oc = roth_conv_amt * 0.09 if cfg["oregon_resident"] else 0.0
+                if cfg["oregon_resident"]:
+                    # Was a flat 9% guess, inconsistent with the marginal-bracket
+                    # approach used for federal (and not matching any actual
+                    # OREGON_BRACKETS rate at typical conversion income levels).
+                    oc = calc_tax(or_taxable + roth_conv_amt, OREGON_BRACKETS, yfb, binfl) - or_tax
+                else:
+                    oc = 0.0
                 roth_conv_tax = fc + oc
         row["Roth_Conversion"], row["Roth_Conversion_Tax"] = roth_conv_amt, roth_conv_tax
 
@@ -412,24 +514,97 @@ def run_simulation(cfg, return_overrides=None):
         surplus = total_income - total_exp - total_tax - roth_conv_tax - irmaa_cost
         ca += surplus
 
+        legacy_roth_per_child = 0.0
+        legacy_inheritance_per_child = 0.0
+        legacy_roth_total = 0.0
+        legacy_inheritance_total = 0.0
         legacy_actual = 0.0
-        if roth_leg > 0 and cfg["num_children"] > 0:
-            ro += roth_leg; ca -= roth_leg; legacy_actual = roth_leg
+        if legacy_target_total > 0 and cfg["num_children"] > 0:
+            if legacy_funding_this_year > 0:
+                # legacy_funding_this_year was already withdrawn from the
+                # household's accounts above via total_exp/need (single
+                # debit, spread across pt/ca/ro/hs by the normal draw
+                # waterfall). It now moves into the segregated legacy_pool --
+                # NOT back into the parents' own `ro` -- because once gifted
+                # it's legally the kids' money, in the kids' own Roth
+                # accounts, no longer part of the household's spendable net
+                # worth and never available for the household's own future
+                # withdrawals. (Previously this was credited back into `ro`,
+                # which meant it was silently drawn back down years later by
+                # the household's own Roth_Draw waterfall -- verified: with
+                # no fix, gifted balances were being spent on the parents'
+                # own retirement expenses in later years.)
+                legacy_roth_total = legacy_funding_this_year
+                legacy_roth_per_child = legacy_target_per_child
+                legacy_pool += legacy_roth_total
+                legacy_actual = legacy_roth_total
+            # Any portion not funded to Roth this year (skipped in a
+            # down-market year) was never withdrawn -- it's still sitting in
+            # the household's own balances. This is a pure label for "will
+            # pass as ordinary inheritance," not a separate pot of money.
+            legacy_inheritance_per_child = max(0.0, legacy_target_per_child - legacy_roth_per_child)
+            legacy_inheritance_total = legacy_inheritance_per_child * cfg["num_children"]
 
-        cum_gifts += gifts; cum_legacy_roth += legacy_actual; cum_lump_sums += lump
+        cum_gifts += gifts
+        cum_legacy_roth += legacy_roth_total
+        cum_legacy_inheritance += legacy_inheritance_total
+        cum_lump_sums += lump
+        n_kids = cfg.get("num_children", 0)
         row["Surplus_Deficit"], row["Total_Income"] = surplus, total_income
+        row["Bad_Return_Year"] = is_negative_return
+        row["Legacy_Roth_Per_Child"] = legacy_roth_per_child
+        row["Legacy_Inheritance_Per_Child"] = legacy_inheritance_per_child
+        row["Legacy_Roth_Total"] = legacy_roth_total
+        row["Legacy_Inheritance_Total"] = legacy_inheritance_total
+        row["Legacy_Total"] = legacy_roth_total + legacy_inheritance_total  # this year's FLOW only, not a running total
         row["Legacy_Roth_Actual"] = legacy_actual
-        row["Cum_Gifts"], row["Cum_Legacy_Roth"], row["Cum_Lump_Sums"] = cum_gifts, cum_legacy_roth, cum_lump_sums
+        row["Cum_Gifts"] = cum_gifts
+        row["Cum_Legacy_Roth"] = cum_legacy_roth  # nominal sum of contributions made (no growth)
+        row["Legacy_Pool_EOY"] = legacy_pool       # actual compounding balance of gifted money
+        row["Legacy_Pool_Per_Child"] = (legacy_pool / n_kids) if n_kids else 0.0
+        row["Cum_Legacy_Inheritance"] = cum_legacy_inheritance
+        row["Cum_Legacy_Inheritance_Per_Child"] = (cum_legacy_inheritance / n_kids) if n_kids else 0.0
+        # Running total legacy VALUE as of this point in time (grown Roth pool
+        # + amounts still sitting in the household's own accounts earmarked
+        # for inheritance). This is what "value at the end of the plan"
+        # should read -- previously that metric read Legacy_Total (this
+        # year's flow), which is 0 in nearly every year outside the
+        # legacy_years gifting window, including almost always the final
+        # simulated year of a multi-decade plan.
+        row["Legacy_Value_To_Date"] = legacy_pool + cum_legacy_inheritance
+        row["Legacy_Value_To_Date_Per_Child"] = row["Legacy_Pool_Per_Child"] + row["Cum_Legacy_Inheritance_Per_Child"]
+        row["Cum_Lump_Sums"] = cum_lump_sums
 
-        if pt <= 0: pt = 0.0; pt_depleted = True
-        if ro <= 0: ro = 0.0; ro_depleted = True
-        if hs <= 0: hs = 0.0; hs_depleted = True
-        if ca < -50_000: ca_depleted = True
+        # Retirement/HSA accounts can't structurally go negative (draws are
+        # already capped at the available balance upstream); this is just a
+        # defensive floor for floating-point noise near zero.
+        pt = max(0.0, pt)
+        ro = max(0.0, ro)
+        hs = max(0.0, hs)
+        legacy_pool = max(0.0, legacy_pool)
+        # Cash IS allowed to go negative -- it represents a genuine funding
+        # shortfall (expenses the plan couldn't cover from any account).
+        # Previously this was floored at $0 in both Cash_EOY and
+        # Total_Liquid_Assets, which hid insolvency: a plan running a large,
+        # growing cash deficit could still show a "positive" total and get
+        # counted as a Monte Carlo success just because pt/ro/hs were still
+        # positive. Now the deficit is shown and counted honestly.
 
         row["PreTax_EOY"], row["Roth_EOY"], row["HSA_EOY"] = pt, ro, hs
-        row["Cash_EOY"] = max(0.0, ca) if ca_depleted else ca
-        total_liquid = pt + ro + hs + max(0.0, ca)
-        row["Total_Liquid_Assets"] = total_liquid
+        row["Cash_EOY"] = ca
+        total_liquid = pt + ro + hs + ca
+        row["Total_Liquid_Assets"] = total_liquid  # parents' own spendable net worth (excludes gifted-away legacy_pool)
+        row["Family_Net_Worth"] = total_liquid + legacy_pool  # includes money already gifted to the kids' Roths
+        # "If death occurs at this age, what would each child actually
+        # receive?" -- this is what Cum_Legacy_Inheritance does NOT capture
+        # (that field only tracks a narrow sub-bucket: legacy-gift TARGET
+        # amounts skipped in down-market years). The real answer is: your
+        # own remaining accounts (Total_Liquid_Assets) pass to your heirs at
+        # death, split evenly here across children, PLUS whatever's already
+        # sitting in their own Roth accounts from prior gifting.
+        row["Estate_At_Death"] = total_liquid  # what's left in your own accounts if you died this year
+        row["Estate_At_Death_Per_Child"] = (total_liquid / n_kids) if n_kids else 0.0
+        row["Total_Inheritance_At_Death_Per_Child"] = (row["Family_Net_Worth"] / n_kids) if n_kids else 0.0
         row["Total_Real"] = (total_liquid / (1 + infl) ** yir) if yir > 0 else total_liquid
 
         total_draws = ptd + rod + hsd + cad
@@ -681,7 +856,12 @@ def export_to_excel(accum_df, retire_df, cfg):
         "Effective_Tax_Rate", "Withdrawal_Rate",
         "RMD", "Roth_Conversion", "Roth_Conversion_Tax",
         "MAGI", "IRMAA_Hit", "IRMAA_Cost",
-        "Cum_Gifts", "Cum_Legacy_Roth", "Cum_Lump_Sums",
+        "Legacy_Target_Per_Child", "Legacy_Roth_Per_Child", "Legacy_Inheritance_Per_Child",
+        "Legacy_Target_Total", "Legacy_Roth_Total", "Legacy_Inheritance_Total", "Legacy_Total",
+        "Bad_Return_Year", "Cum_Gifts", "Cum_Legacy_Roth", "Cum_Legacy_Inheritance", "Cum_Lump_Sums",
+        "Legacy_Pool_EOY", "Legacy_Pool_Per_Child", "Cum_Legacy_Inheritance_Per_Child",
+        "Legacy_Value_To_Date", "Legacy_Value_To_Date_Per_Child",
+        "Family_Net_Worth", "Estate_At_Death", "Estate_At_Death_Per_Child", "Total_Inheritance_At_Death_Per_Child",
     ]
     for c, col in enumerate(ret_cols, 1):
         ws_ret.cell(row=1, column=c, value=col.replace("_", " "))
@@ -714,6 +894,7 @@ def export_to_excel(accum_df, retire_df, cfg):
     # ──────── Sheet 4: Summary ────────
     ws_s = wb.create_sheet("Summary")
     first, last = retire_df.iloc[0], retire_df.iloc[-1]
+    n_kids_xl = int(cfg.get("num_children", 0))
     summary = [
         ("RETIREMENT PLAN SUMMARY", ""),
         ("", ""),
@@ -723,7 +904,7 @@ def export_to_excel(accum_df, retire_df, cfg):
         ("  HSA", first["HSA_EOY"]),
         ("  Cash", first["Cash_EOY"]),
         ("", ""),
-        (f"Assets at Age {cfg['planning_end_age']}", last["Total_Liquid_Assets"]),
+        (f"Your Own Estate at Age {cfg['planning_end_age']}", last["Total_Liquid_Assets"]),
         ("Real Value (inflation-adjusted)", last["Total_Real"]),
         ("", ""),
         ("Avg Withdrawal Rate", retire_df["Withdrawal_Rate"].mean()),
@@ -731,9 +912,27 @@ def export_to_excel(accum_df, retire_df, cfg):
         ("Total Roth Conversions", retire_df["Roth_Conversion"].sum()),
         ("Total Conversion Tax Paid", retire_df["Roth_Conversion_Tax"].sum()),
         ("", ""),
-        ("Cumulative Gifts", last["Cum_Gifts"]),
-        ("Cumulative Legacy Roth", last["Cum_Legacy_Roth"]),
-        ("Cumulative Lump Sums", last["Cum_Lump_Sums"]),
+        ("LEGACY GIFTING", ""),
+        ("Cumulative Annual Gifts (cash, separate from Roth legacy)", last.get("Cum_Gifts", 0.0)),
+        ("Total Gifted to Kids' Roth (nominal, no growth)", last.get("Cum_Legacy_Roth", 0.0)),
+        (f"Legacy Pool Today (grown, age {cfg['planning_end_age']})", last.get("Legacy_Pool_EOY", 0.0)),
+        ("Cum Legacy Inheritance (bad-years-only sub-total, NOT your estate)", last.get("Cum_Legacy_Inheritance", 0.0)),
+        ("Cumulative Lump Sums", last.get("Cum_Lump_Sums", 0.0)),
+        ("", ""),
+        ("ESTATE AT DEATH (if it occurred at the final planning age)", ""),
+        ("Your Own Estate (passes to heirs)", last.get("Estate_At_Death", last["Total_Liquid_Assets"])),
+        ("Already Gifted (Kids' own Roth, grown)", last.get("Legacy_Pool_EOY", 0.0)),
+        ("Total to Family (both combined)", last.get("Family_Net_Worth", last["Total_Liquid_Assets"])),
+    ]
+    if n_kids_xl > 0:
+        summary += [
+            ("", ""),
+            (f"PER CHILD (\u00f7 {n_kids_xl})", ""),
+            ("  Estate / Child", last.get("Estate_At_Death_Per_Child", 0.0)),
+            ("  Roth Pool / Child", last.get("Legacy_Pool_Per_Child", 0.0)),
+            ("  Total / Child", last.get("Total_Inheritance_At_Death_Per_Child", 0.0)),
+        ]
+    summary += [
         ("", ""),
         ("IRMAA Years Hit", int(retire_df["IRMAA_Hit"].sum())),
     ]
@@ -799,10 +998,13 @@ def main():
 
         with st.expander("\U0001F4B0 Current Balances (Today)", expanded=True):
             file_balances, file_loaded = load_starting_balances()
-            if file_loaded:
+            balance_source = get_balance_source(file_balances)
+            if balance_source == "web fetch from Excel":
+                st.success("\U0001F4CA Using balances passed in via URL parameters (Excel launch)")
+            elif balance_source == "using Starting_balances.txt":
                 st.success("Loaded starting_balances.txt")
             else:
-                st.info("No starting_balances.txt found; using defaults")
+                st.info("No starting_balances.txt or URL parameters found; using defaults")
             balance_specs = [
                 ("pretax_input", "pretax", file_balances["401k"] if file_balances["401k"] is not None else 1_475_000),
                 ("roth_input", "roth", file_balances["roth"] if file_balances["roth"] is not None else 510_000),
@@ -874,7 +1076,7 @@ def main():
             exp_red_80 = st.slider("Expense Reduction After 80 (%)", 0, 25, 25, 5) / 100
             st.caption("Lifestyle slowdown: reduce base expenses after age 80.")
             st.subheader("Negative Return Adjustment")
-            neg_ret_reduction = st.number_input("Discretionary Draw Reduction if Year Return < 0 ($)", 0, 200_000, 50_000, step=1000, format="%d")
+            neg_ret_reduction = st.number_input("Discretionary Draw Reduction if Year Return < 0 ($)", 0, 200_000, 20_000, step=1000, format="%d")
             st.subheader("Lump Sum")
             lump_age = st.number_input("Lump at Age", 55, 95, 70)
             lump_amt = st.number_input("Lump Amount ($)", 0, 1_000_000, 0, step=10_000, format="%d")
@@ -930,6 +1132,7 @@ def main():
         roth_conversion_enabled=roth_conv, roth_conversion_target_bracket=roth_bracket,
         roth_conversion_margin=roth_margin, irmaa_avoidance=irmaa_avoid,
         performance_draw_only=perf_only,
+        neg_ret_draw_reduction=neg_ret_reduction,
         num_children=num_kids, roth_legacy_per_child=roth_per_child,
         legacy_years=legacy_years, legacy_inflation=inflation,
     )
@@ -980,7 +1183,11 @@ def main():
     else:
         c1.metric("Starting Assets", f"${first['Total_Liquid_Assets']:,.0f}")
     c2.metric(f"At Retirement ({dollar_label})", f"${first['Total_Liquid_Assets']:,.0f}")
-    c3.metric(f"Age {planning_end} ({dollar_label})", f"${last['Total_Liquid_Assets']:,.0f}")
+    legacy_pool_last = last.get("Legacy_Pool_EOY", 0.0)
+    c3.metric(f"Age {planning_end} ({dollar_label})", f"${last['Total_Liquid_Assets']:,.0f}",
+              delta=(f"+${legacy_pool_last:,.0f} already gifted (see Legacy tab)" if legacy_pool_last > 0 else None),
+              delta_color="off",
+              help="Your own remaining accounts (pretax/Roth/HSA/cash) -- excludes money already gifted to the kids' Roth accounts, since that's no longer part of your own net worth. See the Legacy tab for the combined family total.")
 
     depleted = df[df["Total_Liquid_Assets"] <= 0]
     if len(depleted) > 0:
@@ -998,7 +1205,7 @@ def main():
 
     # ── TABS ──
     tab_names = ["\U0001F4BC Accumulation", "\U0001F4CA Retirement Assets", "\U0001F4B0 Income & Expenses",
-                 "\U0001F3DB Tax", "\U0001F504 Roth Conversions"]
+                 "\U0001F381 Legacy", "\U0001F3DB Tax", "\U0001F504 Roth Conversions"]
     if mc_runs: tab_names.append("\U0001F3B2 Monte Carlo")
     if mc_runs: tab_names.append("\U0001F3AF Optimizer")
     tab_names.append("\U0001F4CB Full Data")
@@ -1067,6 +1274,140 @@ def main():
         fig2.update_layout(title="Surplus / Deficit", xaxis_title="Age", yaxis_title="$",
                            yaxis_tickformat="$,.0f", height=350)
         st.plotly_chart(fig2, use_container_width=True)
+    ti += 1
+
+    # ── Legacy Tab ──
+    with tabs[ti]:
+        st.subheader("Legacy Planning")
+        lg1, lg2, lg3 = st.columns(3)
+        lg1.metric("Children", f"{int(cfg.get('num_children', 0))}")
+        lg2.metric("Legacy Years", f"{int(cfg.get('legacy_years', 0))}")
+        if mc_runs:
+            avg_bad_years = np.mean([r["Bad_Return_Year"].sum() for r in mc_runs])
+            lg3.metric("Avg Bad Return Years (MC)", f"{avg_bad_years:.1f}")
+        else:
+            bad_ct = int(df['Bad_Return_Year'].sum()) if 'Bad_Return_Year' in df.columns else 0
+            lg3.metric("Bad Return Years", f"{bad_ct}")
+            st.caption(
+                "The baseline plan uses one constant assumed return every year, so it "
+                "never has a down year on its own (0 here is expected, not a bug). "
+                "Enable Monte Carlo to see how often a bad year actually skips a legacy "
+                "gift across randomized market paths."
+            )
+
+        n_kids = int(cfg.get("num_children", 0))
+
+        st.markdown("---")
+        st.markdown("##### If you died at a given age, what would your kids actually receive?")
+        st.caption(
+            "Two very different pots make up the answer: money **already gifted** into the "
+            "kids' own Roth accounts (irrevocable, compounding on its own), and whatever's "
+            "**still sitting in your own accounts** at death (pretax, your own Roth, HSA, "
+            "cash) -- which is what actually passes to heirs. 'Cum Legacy Inheritance' further "
+            "below is neither of these; see its note."
+        )
+        min_age, max_age = int(df_disp["Age"].min()), int(df_disp["Age"].max())
+        death_age = st.slider("Hypothetical age at death", min_age, max_age, max_age, key="legacy_death_age")
+        death_row = df_disp[df_disp["Age"] == death_age].iloc[0]
+
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Already Gifted (Kids' Roth, grown)", f"${death_row.get('Legacy_Pool_EOY', 0.0):,.0f}",
+                   help="Money already moved into the kids' own Roth accounts by this age. Already theirs, not part of your estate.")
+        d2.metric("Remaining in Your Estate", f"${death_row.get('Estate_At_Death', death_row['Total_Liquid_Assets']):,.0f}",
+                   help="Whatever's left in your own pretax/Roth/HSA/cash accounts at this age -- this is what passes to heirs at death.")
+        d3.metric("Total to Family", f"${death_row.get('Family_Net_Worth', 0.0):,.0f}",
+                   help="The two combined.")
+
+        if n_kids > 0:
+            st.markdown(f"**Per child (÷ {n_kids}):**")
+            e1, e2, e3 = st.columns(3)
+            e1.metric("Roth Pool / Child", f"${death_row.get('Legacy_Pool_Per_Child', 0.0):,.0f}")
+            e2.metric("Estate / Child", f"${death_row.get('Estate_At_Death_Per_Child', 0.0):,.0f}")
+            e3.metric("Total / Child", f"${death_row.get('Total_Inheritance_At_Death_Per_Child', 0.0):,.0f}")
+        else:
+            st.caption("Set Number of Children > 0 to see a per-child split.")
+
+        fig_estate = go.Figure()
+        fig_estate.add_trace(go.Scatter(x=df_disp["Age"], y=df_disp["Estate_At_Death"], name="Remaining Estate (your own accounts)",
+                                        line=dict(color="teal", width=0.5), stackgroup="one", fillcolor="rgba(0,128,128,0.4)"))
+        fig_estate.add_trace(go.Scatter(x=df_disp["Age"], y=df_disp["Legacy_Pool_EOY"], name="Already Gifted (Kids' Roth)",
+                                        line=dict(color="purple", width=0.5), stackgroup="one", fillcolor="rgba(128,0,128,0.4)"))
+        fig_estate.add_vline(x=death_age, line_dash="dash", line_color="red")
+        fig_estate.update_layout(title="What Would Pass to Family, by Age of Death", xaxis_title="Age",
+                                  yaxis_title=dollar_label, yaxis_tickformat="$,.0f", height=420)
+        st.plotly_chart(fig_estate, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("##### Legacy Gifting Detail")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Gifted (nominal)", f"${df_disp.iloc[-1]['Cum_Legacy_Roth']:,.0f}",
+                   help="Sum of contribution amounts, at the time each was made -- does not include growth.")
+        c2.metric("Legacy Pool Today", f"${df_disp.iloc[-1].get('Legacy_Pool_EOY', 0.0):,.0f}",
+                   help="What that gifted money has actually grown to, compounding on its own in the kids' Roth accounts. Same number as 'Already Gifted' above.")
+        c3.metric("Cum Legacy Inheritance (bad-years only)", f"${df_disp.iloc[-1].get('Cum_Legacy_Inheritance', 0.0):,.0f}",
+                   help="NOT your general estate. This is only the sub-total of gift TARGETS that were skipped in down-market years and left invested rather than gifted to Roth. It's $0 whenever the plan never hits a down year (see note above) -- for what actually passes to your heirs at any age, use the 'Remaining in Your Estate' section above instead.")
+        c4.metric("Total Legacy Value (Today)", f"${df_disp.iloc[-1].get('Legacy_Value_To_Date', 0.0):,.0f}",
+                   help="Legacy Pool + Cum Legacy Inheritance (the bad-years sub-total, not your full estate).")
+
+        # ── Legacy Pool balance over time (the actual compounding balance,
+        # not just the annual flow into it) ──
+        fig_leg_bal = go.Figure()
+        fig_leg_bal.add_trace(go.Scatter(x=df_disp["Age"], y=df_disp["Legacy_Pool_EOY"],
+                                          name="Legacy Pool (grown)", line=dict(color="purple", width=3),
+                                          fill="tozeroy", fillcolor="rgba(128,0,128,0.1)"))
+        fig_leg_bal.add_trace(go.Scatter(x=df_disp["Age"], y=df_disp["Cum_Legacy_Roth"],
+                                          name="Cumulative Gifted (nominal, no growth)",
+                                          line=dict(color="gray", width=2, dash="dot")))
+        if 'Cum_Legacy_Inheritance' in df_disp.columns and df_disp['Cum_Legacy_Inheritance'].iloc[-1] > 0:
+            fig_leg_bal.add_trace(go.Scatter(x=df_disp["Age"], y=df_disp["Legacy_Value_To_Date"],
+                                              name="Total Legacy Value (Pool + Inheritance)",
+                                              line=dict(color="darkgoldenrod", width=2, dash="dash")))
+        fig_leg_bal.update_layout(title="Legacy Pool: Balance vs. Nominal Contributions", xaxis_title="Age",
+                                  yaxis_title=dollar_label, yaxis_tickformat="$,.0f", height=420)
+        st.plotly_chart(fig_leg_bal, use_container_width=True)
+        st.caption(
+            "The gap between the purple and gray lines is investment growth on money already "
+            "gifted. This balance is segregated from the household's own accounts -- it "
+            "compounds on its own and is never drawn back down to cover the household's "
+            "living expenses."
+        )
+
+        if n_kids > 0:
+            fig_leg_pc_bal = go.Figure()
+            fig_leg_pc_bal.add_trace(go.Scatter(x=df_disp["Age"], y=df_disp["Legacy_Pool_Per_Child"],
+                                                 name="Roth Pool / Child (grown)", line=dict(color="purple", width=2.5)))
+            fig_leg_pc_bal.add_trace(go.Scatter(x=df_disp["Age"], y=df_disp["Cum_Legacy_Inheritance_Per_Child"],
+                                                 name="Inheritance / Child", line=dict(color="goldenrod", width=2.5)))
+            fig_leg_pc_bal.update_layout(title="Per-Child Legacy Value Over Time", xaxis_title="Age",
+                                         yaxis_title=dollar_label, yaxis_tickformat="$,.0f", height=380)
+            st.plotly_chart(fig_leg_pc_bal, use_container_width=True)
+
+        fig_leg_pc = go.Figure()
+        fig_leg_pc.add_trace(go.Bar(x=df_disp["Age"], y=df_disp["Legacy_Roth_Per_Child"], name="Roth per Child", marker_color="purple"))
+        fig_leg_pc.add_trace(go.Bar(x=df_disp["Age"], y=df_disp["Legacy_Inheritance_Per_Child"], name="Inheritance per Child", marker_color="goldenrod"))
+        fig_leg_pc.update_layout(barmode="group", title="Annual Legacy Gift per Child by Age", xaxis_title="Age",
+                                 yaxis_title=dollar_label, yaxis_tickformat="$,.0f", height=420)
+        st.plotly_chart(fig_leg_pc, use_container_width=True)
+
+        fig_leg_total = go.Figure()
+        fig_leg_total.add_trace(go.Bar(x=df_disp["Age"], y=df_disp["Legacy_Roth_Total"], name="Roth Total", marker_color="mediumpurple"))
+        fig_leg_total.add_trace(go.Bar(x=df_disp["Age"], y=df_disp["Legacy_Inheritance_Total"], name="Inheritance Total", marker_color="darkgoldenrod"))
+        fig_leg_total.update_layout(barmode="stack", title="Annual Legacy Gift Total by Age", xaxis_title="Age",
+                                    yaxis_title=dollar_label, yaxis_tickformat="$,.0f", height=420)
+        st.plotly_chart(fig_leg_total, use_container_width=True)
+
+        legacy_cols = [c for c in [
+            "Age", "Year", "Bad_Return_Year",
+            "Estate_At_Death", "Estate_At_Death_Per_Child",
+            "Legacy_Pool_EOY", "Legacy_Pool_Per_Child",
+            "Family_Net_Worth", "Total_Inheritance_At_Death_Per_Child",
+            "Legacy_Target_Per_Child", "Legacy_Roth_Per_Child", "Legacy_Inheritance_Per_Child",
+            "Legacy_Target_Total", "Legacy_Roth_Total", "Legacy_Inheritance_Total", "Legacy_Total",
+            "Cum_Legacy_Roth", "Cum_Legacy_Inheritance", "Cum_Legacy_Inheritance_Per_Child",
+            "Legacy_Value_To_Date", "Legacy_Value_To_Date_Per_Child",
+        ] if c in df_disp.columns]
+        st.dataframe(df_disp[legacy_cols], use_container_width=True, hide_index=True)
     ti += 1
 
     # ── Tax Tab ──
@@ -1218,15 +1559,18 @@ def main():
                  "SS_Income","JSS_Income","Rental_Income","S_Plus_Income","Passive_Income",
                  "PreTax_Draw","Roth_Draw","Cash_Draw","HSA_Draw",
                  "PreTax_EOY","Roth_EOY","HSA_EOY","Cash_EOY",
-                 "Total_Liquid_Assets","Total_Income","Total_Expenses","Total_Tax",
+                 "Total_Liquid_Assets","Family_Net_Worth","Total_Income","Total_Expenses","Total_Tax",
                  "Effective_Tax_Rate","Withdrawal_Rate","Surplus_Deficit",
-                 "Roth_Conversion","RMD","RMD_Excess","IRMAA_Hit",
-                 "Cum_Gifts","Cum_Legacy_Roth","Cum_Lump_Sums"]
+                 "Roth_Conversion","RMD","RMD_Excess","IRMAA_Hit","Bad_Return_Year",
+                 "Legacy_Target_Per_Child","Legacy_Roth_Per_Child","Legacy_Inheritance_Per_Child",
+                 "Legacy_Target_Total","Legacy_Roth_Total","Legacy_Inheritance_Total","Legacy_Total",
+                 "Cum_Gifts","Cum_Legacy_Roth","Legacy_Pool_EOY","Cum_Legacy_Inheritance","Cum_Lump_Sums",
+                 "Estate_At_Death"]
         avail = [c for c in dcols if c in df_disp.columns]
         show = st.multiselect("Columns", df_disp.columns.tolist(), default=avail)
         disp = df_disp[show].copy()
         no_fmt = {"Age","Year","Years_Retired","Effective_Tax_Rate","Withdrawal_Rate","PreTax_WR",
-                  "IRMAA_Hit","Under_700_FPL","In_12_Bracket","In_22_Bracket","Draw_Strategy",
+                  "IRMAA_Hit","Bad_Return_Year","Under_700_FPL","In_12_Bracket","In_22_Bracket","Draw_Strategy",
                   "PreTax_Depleted","Roth_Depleted","HSA_Depleted","Return_PreTax","Return_Roth","Return_HSA","Return_Cash","Phase"}
         pct = {"Effective_Tax_Rate","Withdrawal_Rate","PreTax_WR","Return_PreTax","Return_Roth","Return_HSA","Return_Cash"}
         fmt = {}
@@ -1256,6 +1600,10 @@ def main():
 **Draw Strategy:** Pre-RMD: PreTax up to 12% bracket → Cash → Roth → HSA. RMD Phase (75+): mandatory RMD first → Cash → Roth → HSA. Roth conversions fill remaining bracket space.
 
 **Monte Carlo:** Returns ~ N(target, std_dev), capped at max upside. Cash uses 1/3 std dev.
+
+**Legacy Gifting:** In a year with positive/neutral returns, the target Roth gift is withdrawn once (via the normal draw waterfall) and credited to the Roth balance. In a down-market year, the gift is skipped entirely and the target amount simply stays invested — it isn't withdrawn, and "Legacy Inheritance" is a label for that still-invested amount, not a separate pot of money.
+
+**Cash Shortfalls:** Cash is allowed to go negative to represent a genuine funding gap; it is not floored to $0, so Total_Liquid_Assets and Monte Carlo success rates reflect real shortfalls rather than hiding them.
 
 **Excel Export:** 4-sheet workbook: Assumptions, Accumulation, Retirement, Summary.
         """)
