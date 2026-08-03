@@ -1,11 +1,80 @@
 """
-Retirement Income and Tax Planning Simulator v6
+Retirement Income and Tax Planning Simulator v9
 ================================================
 With accumulation phase, Monte Carlo, and Excel export.
 
 Usage:
   pip install streamlit plotly pandas numpy openpyxl
-  streamlit run retirement_v6.py
+  streamlit run retirement_v9.py
+
+v9 fix:
+1. "Discretionary Draw Reduction if Year Return < 0" was a fixed nominal
+dollar amount for the entire plan, while base_annual_expenses (and every
+other spending line) inflates every year. That meant the same-looking
+cut had a shrinking REAL bite over time -- 11.9% of base expenses in
+year 1 vs. 5.1% by year 30 in a typical scenario, worth less than half
+its original purchasing power. Now indexed to inflation like everything
+else: entered in today's dollars, scaled by (1+infl)**yir each year, so
+a bad year in year 1 and a bad year in year 30 get an equivalent real
+cut. UI label updated to "(today's $)" to make this explicit.
+
+v7 enhancements (financial modeling, on top of v6's correctness fixes):
+  1. Cash/MM interest is now taxed annually as ordinary income (was
+     completely untaxed before -- both growth and withdrawals).
+  2. Legacy pool has its own configurable return/std-dev assumption
+     instead of automatically matching your own Roth account.
+  3. Monte Carlo now correlates PreTax/Roth/HSA/Legacy Pool returns via a
+     shared market factor (configurable strength) instead of drawing each
+     bucket fully independently, which understated true sequence-of-returns
+     tail risk. Cash/MM gets a smaller fraction of that correlation.
+  4. Optional fat-tailed (Student-t) return distribution as an alternative
+     to Normal, for more realistic crash frequency/severity.
+  5. Optional "surviving spouse" scenario: filing status switches from MFJ
+     to Single the year after the first spouse's death, with single-filer
+     brackets/deduction/IRMAA threshold, a partial SS survivor benefit, and
+     optional pension and living-expense reductions (the "widow's penalty").
+  6. Legacy/estate figures now also show an after-tax-to-heirs value:
+     inherited pretax/HSA money is taxed at an assumed heir rate under the
+     SECURE Act's 10-year rule, while Roth (including the legacy pool)
+     passes tax-free -- these are not equivalent dollars to your heirs.
+  7. Optional dynamic "guardrails" spending strategy (Guyton-Klinger style)
+     as an alternative to fixed real spending: a persistent spending cut/
+     raise triggered by your trailing withdrawal rate drifting outside a
+     band around your starting rate.
+  8. Excel export gained a Monte Carlo sheet (percentile bands + success
+     rate) whenever Monte Carlo is enabled.
+  9. New Sensitivity (tornado) tab: varies one assumption at a time to show
+     which ones actually move your outcome the most.
+
+v8 fixes (Guyton-Klinger guardrail realism):
+1. guardrail_factor previously had no floor and no cap on cumulative
+drift: a persistent multiplicative decay ((1-adj) compounded every
+consecutive "stressed" year, with no reset) could compound base
+spending down to an unrealistically low fraction of the original plan
+during a prolonged downturn/Monte Carlo tail path. Now floored at a
+configurable guardrail_floor_pct (default 50% of original spending)
+and capped at guardrail_ceiling_pct (default 150%) on the upside, so
+the model can never imply a household is living on, e.g., 20% of its
+intended budget indefinitely.
+2. Verified (no fix needed, confirmed correct): base_exp and all other
+expense lines in a "bad return year" are computed from the SAME
+inflation-adjusted formula used every other year (base_annual_expenses
+* (1+infl)**yir, healthcare at its own inflation rate, etc.) before
+any negative-return discretionary reduction or guardrail multiplier is
+applied. The neg_ret_draw_reduction is capped at total_exp so it can
+subtract but never invert sign the already-correctly-inflated total.
+3. Legacy-contribution inflation growth verified correct (Legacy_Target_Total
+compounds at the General Inflation rate every year in both the model and
+the Excel export) -- confirmed by direct cell inspection. A flat $30,000
+every year is only mathematically exact when General Inflation is set to
+0%; any positive inflation rate produces genuine year-over-year growth.
+4. Excel "Retirement" sheet was missing ~35 fields that exist in the model,
+including Guardrail_Factor itself (needed to audit fix #1 above),
+Filing_Status, the realized per-bucket returns (Return_PreTax/Roth/HSA/
+Cash/Legacy_Pool -- needed to audit Monte Carlo correlation and fat
+tails), the full tax/deduction breakdown, and the after-tax-to-heirs
+figures. All added, with correct percent/boolean/text formatting
+(previously everything not explicitly listed defaulted to money format).
 
 v6 correctness fixes (from a full audit of v5):
   1. Legacy Roth gifts were being subtracted from cash TWICE (once via
@@ -68,16 +137,27 @@ RMD_TABLE = {
 }
 RMD_TABLE_FLOOR_FACTOR = 2.0  # "120 and older" per the IRS table
 IRMAA_MAGI_THRESHOLD = 206_000
+IRMAA_MAGI_THRESHOLD_SINGLE = 103_000  # single-filer IRMAA tier-1 threshold (~half of MFJ)
 IRMAA_MONTHLY_SURCHARGE = 230.80
 FEDERAL_BRACKETS = [
     (0.10, 24_800), (0.12, 100_800), (0.22, 211_400),
     (0.24, 403_550), (0.32, 512_450), (0.35, 768_700),
     (0.37, float("inf")),
 ]
+# Single-filer brackets: ~half of MFJ through the 32% bracket (matches how the
+# real brackets compare), then diverging at the top since MFJ gets
+# disproportionately more room in the 35% bracket than a simple halving would give.
+SINGLE_FEDERAL_BRACKETS = [
+    (0.10, 12_400), (0.12, 50_400), (0.22, 105_700),
+    (0.24, 201_775), (0.32, 256_225), (0.35, 609_350),
+    (0.37, float("inf")),
+]
 OREGON_BRACKETS = [
     (0.0475, 8_824), (0.0675, 22_059),
     (0.0875, 250_000), (0.0990, 10_000_000),
 ]
+# Oregon's single-vs-MFJ bracket differences are much smaller than federal's;
+# OREGON_BRACKETS is used for both filing statuses as a documented simplification.
 
 # ============================================================
 # TAX ENGINE
@@ -99,17 +179,19 @@ def bracket_ceiling(brackets, target_rate, yrs, infl):
             return ceil * (1 + infl) ** yrs if ceil != float("inf") else float("inf")
     return 0.0
 
-def ss_taxable_portion(ss, other):
+def ss_taxable_portion(ss, other, single=False):
     if ss <= 0: return 0.0
     prov = other + ss * 0.5
-    if prov < 32_000: return 0.0
-    elif prov < 44_000: return min(ss * 0.5, (prov - 32_000) * 0.5)
+    tier1, tier2 = (25_000, 34_000) if single else (32_000, 44_000)
+    tier2_cap = 4_500 if single else 6_000  # single-filer worksheet cap is $4,500 (half of MFJ's $6,000)
+    if prov < tier1: return 0.0
+    elif prov < tier2: return min(ss * 0.5, (prov - tier1) * 0.5)
     else:
-        # IRS worksheet caps the tier-2 add-on at min($6,000, 50% of SS
-        # benefits) — a flat $6,000 overstates taxable SS whenever benefits
-        # are under ~$12k/yr (0.5*ss < 6000).
-        tier2_addon = min(6_000, ss * 0.5)
-        return min(ss * 0.85, tier2_addon + (prov - 44_000) * 0.85)
+        # IRS worksheet caps the tier-2 add-on at min(cap, 50% of SS
+        # benefits) — a flat cap overstates taxable SS whenever benefits
+        # are low relative to the cap (0.5*ss < cap).
+        tier2_addon = min(tier2_cap, ss * 0.5)
+        return min(ss * 0.85, tier2_addon + (prov - tier2) * 0.85)
 
 def get_rmd(bal, age, start):
     if age < start or bal <= 0: return 0.0
@@ -121,8 +203,53 @@ def get_rmd(bal, age, start):
         f = RMD_TABLE[min(RMD_TABLE)]  # shouldn't happen given the age < start guard above
     return bal / f if f > 0 else 0.0
 
-def generate_returns(target, std, mx, n, rng):
-    return np.clip(rng.normal(loc=target, scale=std, size=n), -1.0, mx)
+def _standardized_shock(n, rng, fat_tailed, t_df):
+    """Mean-0, unit-variance shock series. Normal by default; Student-t gives
+    fatter tails (more frequent/severe extreme years) when fat_tailed=True."""
+    if fat_tailed:
+        raw = rng.standard_t(t_df, size=n)
+        return raw / np.sqrt(t_df / (t_df - 2))  # rescale to unit variance
+    return rng.standard_normal(n)
+
+def generate_returns(target, std, mx, n, rng, fat_tailed=False, t_df=5):
+    """Independent (uncorrelated) return series for a single bucket."""
+    z = _standardized_shock(n, rng, fat_tailed, t_df)
+    return np.clip(target + std * z, -1.0, mx)
+
+def generate_correlated_returns(bucket_specs, n, rng, correlation=0.85, fat_tailed=False, t_df=5):
+    """
+    bucket_specs: {name: (target, std, max_up)}.
+    All buckets share one common market shock (weighted by `correlation`),
+    plus their own idiosyncratic shock -- mirrors how real accounts holding
+    similar underlying assets move together in the same year rather than
+    being statistically independent of each other.
+    """
+    common = _standardized_shock(n, rng, fat_tailed, t_df)
+    out = {}
+    for name, (target, std, mx) in bucket_specs.items():
+        idio = _standardized_shock(n, rng, fat_tailed, t_df)
+        z = correlation * common + np.sqrt(max(0.0, 1 - correlation ** 2)) * idio
+        out[name] = np.clip(target + std * z, -1.0, mx)
+    return out
+
+def build_mc_return_overrides(cfg, num_years, rng, std_dev, max_up, correlation=0.85, fat_tailed=False, t_df=5):
+    """One year-by-year correlated return series per bucket for a single
+    Monte Carlo path, including the legacy pool's own return/std assumption."""
+    bucket_specs = {
+        "pretax": (cfg["pretax_return"], std_dev, max_up),
+        "roth": (cfg["roth_return"], std_dev, max_up),
+        "hsa": (cfg["hsa_return"], std_dev, max_up),
+        "legacy_pool": (cfg.get("legacy_pool_return", cfg["roth_return"]),
+                         cfg.get("legacy_pool_std", std_dev), max_up),
+    }
+    ov = generate_correlated_returns(bucket_specs, num_years, rng, correlation, fat_tailed, t_df)
+    # Cash/MM: much lower volatility, only lightly correlated with the
+    # broader equity market (money-market rates track policy rates, not stocks).
+    ov["cash"] = generate_correlated_returns(
+        {"cash": (cfg["cash_return"], std_dev / 3, max_up / 2)},
+        num_years, rng, correlation * 0.3, fat_tailed, t_df,
+    )["cash"]
+    return ov
 
 
 def load_starting_balances(path="starting_balances.txt"):
@@ -286,6 +413,16 @@ def run_simulation(cfg, return_overrides=None):
     # Roth) so it (a) compounds on its own and can be charted, and (b) can
     # never be drawn back out by the household's own retirement withdrawals.
 
+    # Guyton-Klinger-style dynamic guardrails (optional alternative to fixed
+    # real spending). guardrail_factor is a persistent multiplier on base
+    # spending -- it only changes when last year's withdrawal rate breached a
+    # guardrail, and the change compounds forward (a permanent step, not a
+    # one-year blip), same as the real strategy.
+    use_guardrails = cfg.get("spending_strategy") == "guardrails"
+    guardrail_factor = 1.0
+    initial_wr = None
+    prev_wr = None
+
     for idx in range(num_years):
         age = ret_age + idx
         yr = ret_year + idx
@@ -293,6 +430,42 @@ def run_simulation(cfg, return_overrides=None):
         yir = idx
 
         row = {"Phase": "Retirement", "Age": age, "Year": yr, "Years_Retired": yir}
+
+        # Surviving-spouse ("widow's penalty") scenario: filing status switches
+        # from MFJ to Single starting the year AFTER the first spouse's death
+        # (the IRS allows MFJ status for the year of death itself). Off by
+        # default -- when disabled, behavior is identical to before.
+        is_widowed = bool(cfg.get("model_widow_scenario", False)) and age > cfg.get("first_death_age", 999)
+        row["Filing_Status"] = "Single (Widowed)" if is_widowed else "MFJ"
+        fed_brackets_yr = SINGLE_FEDERAL_BRACKETS if is_widowed else FEDERAL_BRACKETS
+        std_ded_multiplier = 0.5 if is_widowed else 1.0  # single standard deduction is ~half of MFJ's
+        irmaa_threshold_base = IRMAA_MAGI_THRESHOLD_SINGLE if is_widowed else IRMAA_MAGI_THRESHOLD
+
+        # ── DYNAMIC GUARDRAILS (Guyton-Klinger style) ──
+        # Evaluated using LAST year's ending withdrawal rate (the portfolio
+        # condition known at the start of this year), before this year's
+        # spending is set -- same sequencing as the real strategy.
+        if use_guardrails and yir > 0 and initial_wr and prev_wr is not None:
+            band = cfg.get("guardrail_band_pct", 0.20)
+            adj = cfg.get("guardrail_adjustment_pct", 0.10)
+            # Floor/ceiling on the CUMULATIVE guardrail_factor -- v7 let this
+            # multiplier compound every consecutive breach year with no
+            # bound, so a sustained downturn (or a Monte Carlo tail path)
+            # could decay spending to an unrealistically small fraction of
+            # the original plan (e.g. 0.9**10 ~= 35%). Real Guyton-Klinger
+            # implementations bound the cumulative deviation from the
+            # starting spending level rather than letting cuts/raises stack
+            # indefinitely. Defaults: never below 50% or above 150% of the
+            # plan's original (uninflated) spending level.
+            guardrail_floor = cfg.get("guardrail_floor_pct", 0.50)
+            guardrail_ceiling = cfg.get("guardrail_ceiling_pct", 1.50)
+            upper, lower = initial_wr * (1 + band), initial_wr * (1 - band)
+            if prev_wr > upper:
+                guardrail_factor *= (1 - adj)   # portfolio stressed -- cut spending
+            elif 0 < prev_wr < lower:
+                guardrail_factor *= (1 + adj)   # portfolio well ahead -- give a raise
+            guardrail_factor = min(max(guardrail_factor, guardrail_floor), guardrail_ceiling)
+        row["Guardrail_Factor"] = guardrail_factor
 
         # ── GROWTH ──
         # "Depleted" is now evaluated live off the current balance every year,
@@ -303,25 +476,40 @@ def run_simulation(cfg, return_overrides=None):
         if return_overrides:
             r_pt, r_ro = return_overrides["pretax"][yir], return_overrides["roth"][yir]
             r_hs, r_ca = return_overrides["hsa"][yir], return_overrides["cash"][yir]
+            r_lp = return_overrides["legacy_pool"][yir] if "legacy_pool" in return_overrides else r_ro
         else:
             r_pt, r_ro, r_hs, r_ca = pr_pt, pr_ro, pr_hs, pr_ca
+            r_lp = cfg.get("legacy_pool_return", pr_ro)
 
         # Snapshot the pretax balance as of the *prior* year-end, before this
         # year's growth is applied — RMDs are legally based on the 12/31
         # balance from the year before, not a balance that already includes
         # this year's market movement.
         pt_prior_year_end = pt
+        ca_pre_growth = ca  # snapshot before growth, used to compute this year's taxable interest below
 
         if yir > 0:
             if pt > 0: pt *= (1 + r_pt)
             if ro > 0: ro *= (1 + r_ro)
             if hs > 0: hs *= (1 + r_hs)
             if ca > CASH_DISTRESS_FLOOR: ca *= (1 + r_ca)
-            if legacy_pool > 0: legacy_pool *= (1 + r_ro)
+            if legacy_pool > 0: legacy_pool *= (1 + r_lp)
             row["Return_PreTax"], row["Return_Roth"] = r_pt, r_ro
             row["Return_HSA"], row["Return_Cash"] = r_hs, r_ca
+            row["Return_Legacy_Pool"] = r_lp
         else:
             row["Return_PreTax"] = row["Return_Roth"] = row["Return_HSA"] = row["Return_Cash"] = 0.0
+            row["Return_Legacy_Pool"] = 0.0
+
+        # Cash/MM interest is taxable annually as ordinary income (a money
+        # market fund doesn't defer tax the way an equity account's
+        # unrealized gains do) -- computed off the balance BEFORE this year's
+        # growth and draws. Previously cash growth and withdrawals were never
+        # taxed anywhere in the model.
+        cash_interest_taxable = 0.0
+        if cfg.get("tax_cash_interest", True) and yir > 0 and ca_pre_growth > 0:
+            cash_interest_taxable = ca_pre_growth * r_ca
+        row["Cash_Interest_Taxable"] = cash_interest_taxable
 
         # ── INCOME SOURCES ──
         sp_inc = 0.0
@@ -334,11 +522,23 @@ def run_simulation(cfg, return_overrides=None):
             jss_inc = cfg["jss_annual_amount"] * (1 + cfg["jss_cola"]) ** (age - cfg["jss_start_age"])
             if jss_rec_rem > 0: jss_rec_rem -= 1
             else: jss_tax = jss_inc
+        if is_widowed:
+            # Pension survivorship: many plans pay a reduced (or zero) benefit
+            # to the survivor. Default 100% (no change) unless configured.
+            jss_survivor_pct = cfg.get("jss_survivor_pct", 1.0)
+            jss_inc *= jss_survivor_pct
+            jss_tax *= jss_survivor_pct
         row["JSS_Income"], row["JSS_Taxable"] = jss_inc, jss_tax
 
         ss_inc = 0.0
         if age >= cfg["ss_start_age"]:
             ss_inc = cfg["ss_annual_amount"] * (1 + cfg["ss_cola"]) ** (age - cfg["ss_start_age"])
+        if is_widowed:
+            # Social Security survivor benefit: the survivor keeps the HIGHER
+            # of the two individual benefits, effectively losing the smaller
+            # one. Modeled as a configurable % of the combined household
+            # benefit retained (default 65%).
+            ss_inc *= cfg.get("ss_survivor_pct", 0.65)
         row["SS_Income"] = ss_inc
 
         rent_inc = cfg["rental_gross"] * (1 + infl) ** yir
@@ -346,10 +546,28 @@ def run_simulation(cfg, return_overrides=None):
         row["Rental_Income"], row["Rental_Taxable"] = rent_inc, rent_tax
 
         # ── EXPENSES ──
-        base_exp = cfg["base_annual_expenses"] * (1 + infl) ** yir
+        # Pure inflation-adjusted "Annual Expenses" figure, before ANY
+        # strategy-driven adjustment (post-80, widowhood, guardrails,
+        # negative-return cut). Recorded for audit -- confirms every
+        # scenario, including bad-return years, starts from the correctly
+        # inflated baseline rather than some stale/un-inflated number.
+        base_exp_inflated_only = cfg["base_annual_expenses"] * (1 + infl) ** yir
+        base_exp = base_exp_inflated_only
         # Post-80 expense reduction (lifestyle slowdown)
         if age >= 80:
             base_exp *= (1 - cfg.get("expense_reduction_post80", 0.0))
+        # Widowhood expense reduction (one person's living costs, on top of
+        # any post-80 reduction that also applies)
+        if is_widowed:
+            base_exp *= (1 - cfg.get("expense_reduction_widowhood", 0.0))
+        # Dynamic guardrails: a persistent step up/down based on the
+        # portfolio's trailing withdrawal rate (distinct from, and stacks
+        # with, the reductions above and the same-year bad-return cut below --
+        # this reacts to multi-year trajectory, those react to lifestyle age
+        # or a single bad year). guardrail_factor is now floored/ceilinged
+        # above so this can never collapse spending to an unrealistic level.
+        if use_guardrails:
+            base_exp *= guardrail_factor
         healthcare = (cfg["healthcare_pre_medicare"] if age < 65 else cfg["healthcare_post_medicare"]) * (1 + cfg["healthcare_inflation"]) ** yir
         hdhp = cfg["hdhp_annual"] * (1 + infl) ** yir if age < 65 else 0.0
         gifts = cfg["gifts_annual"] * (1 + infl) ** yir
@@ -384,7 +602,13 @@ def run_simulation(cfg, return_overrides=None):
         total_exp = base_exp + healthcare + hdhp + gifts + lump + legacy_funding_this_year
 
         if is_negative_return:
-            reduction = cfg.get("neg_ret_draw_reduction", 0.0)
+            # v9: was a fixed nominal dollar amount for the whole plan while
+            # base_exp inflates every year, so the same-looking cut had a
+            # shrinking real bite over time (11.9% of base expenses in year 1
+            # down to 5.1% by year 30 in a typical scenario). The input is
+            # entered in today's dollars and now inflates alongside
+            # everything else it's meant to offset.
+            reduction = cfg.get("neg_ret_draw_reduction", 0.0) * (1 + infl) ** yir
             # Cannot reduce expenses below 0, but total_exp should be large enough
             reduction_applied = min(reduction, total_exp)
             total_exp -= reduction_applied
@@ -407,11 +631,11 @@ def run_simulation(cfg, return_overrides=None):
         # ── BRACKET-OPTIMIZED DRAW STRATEGY ──
         ptd = rod = hsd = cad = 0.0
         need = max(0.0, total_exp - passive)
-        std_ded_est = cfg["standard_deduction"] * (1 + binfl) ** yfb
+        std_ded_est = cfg["standard_deduction"] * std_ded_multiplier * (1 + binfl) ** yfb
         base_taxable = jss_tax + rent_tax + sp_inc
-        sst_est = ss_taxable_portion(ss_inc, base_taxable)
+        sst_est = ss_taxable_portion(ss_inc, base_taxable, single=is_widowed)
         existing_taxable = base_taxable + sst_est
-        br12_gross = bracket_ceiling(FEDERAL_BRACKETS, 0.12, yfb, binfl)
+        br12_gross = bracket_ceiling(fed_brackets_yr, 0.12, yfb, binfl)
         pretax_room_12 = max(0.0, br12_gross + std_ded_est - existing_taxable)
         is_rmd_phase = age >= cfg["rmd_start_age"]
 
@@ -450,10 +674,10 @@ def run_simulation(cfg, return_overrides=None):
         row["RMD_Excess"] = max(0.0, rmd - (total_exp - passive)) if is_rmd_phase else 0.0
 
         # ── TAX ──
-        other_taxable = ptd + jss_tax + rent_tax + sp_inc
-        sst = ss_taxable_portion(ss_inc, other_taxable)
+        other_taxable = ptd + jss_tax + rent_tax + sp_inc + cash_interest_taxable
+        sst = ss_taxable_portion(ss_inc, other_taxable, single=is_widowed)
         gross_taxable = other_taxable + sst
-        std_ded = cfg["standard_deduction"] * (1 + binfl) ** yfb
+        std_ded = cfg["standard_deduction"] * std_ded_multiplier * (1 + binfl) ** yfb
         med_ded = max(0.0, healthcare - 0.075 * gross_taxable)
         # NOTE: the non-taxable portion of JSS income (jss_inc - jss_tax) was
         # previously added here too. That income was never included in
@@ -463,7 +687,7 @@ def run_simulation(cfg, return_overrides=None):
         item_ded = med_ded + hdhp
         best_ded = max(std_ded, item_ded)
         fed_taxable = max(0.0, gross_taxable - best_ded)
-        fed_tax = calc_tax(fed_taxable, FEDERAL_BRACKETS, yfb, binfl)
+        fed_tax = calc_tax(fed_taxable, fed_brackets_yr, yfb, binfl)
         # Oregon fully exempts Social Security. The only SS-related dollars
         # ever present in gross_taxable are `sst` (other_taxable has no raw
         # ss_inc term), so subtracting `sst` alone fully backs SS out of the
@@ -480,9 +704,10 @@ def run_simulation(cfg, return_overrides=None):
         row["Effective_Tax_Rate"] = total_tax / gross_taxable if gross_taxable > 0 else 0.0
 
         magi = gross_taxable + (ss_inc - sst)
-        irmaa_thr = IRMAA_MAGI_THRESHOLD * (1 + binfl) ** yfb
+        irmaa_thr = irmaa_threshold_base * (1 + binfl) ** yfb
         irmaa_hit = age >= 65 and magi > irmaa_thr
-        irmaa_cost = (IRMAA_MONTHLY_SURCHARGE * 12 * 2 * (1 + infl) ** yfb) if irmaa_hit else 0.0
+        irmaa_people = 1 if is_widowed else 2  # only one person on Medicare once widowed
+        irmaa_cost = (IRMAA_MONTHLY_SURCHARGE * 12 * irmaa_people * (1 + infl) ** yfb) if irmaa_hit else 0.0
         row["MAGI"], row["IRMAA_Threshold"] = magi, irmaa_thr
         row["IRMAA_Hit"], row["IRMAA_Cost"] = irmaa_hit, irmaa_cost
         fpl_700 = 7 * 20_440 * (1 + infl) ** yfb
@@ -492,12 +717,12 @@ def run_simulation(cfg, return_overrides=None):
         roth_conv_amt = roth_conv_tax = 0.0
         if cfg["roth_conversion_enabled"] and pt - ptd > cfg["roth_conversion_margin"]:
             tgt = 0.12 if cfg["roth_conversion_target_bracket"] == "12%" else 0.22
-            conv_room = max(0.0, bracket_ceiling(FEDERAL_BRACKETS, tgt, yfb, binfl) - fed_taxable)
+            conv_room = max(0.0, bracket_ceiling(fed_brackets_yr, tgt, yfb, binfl) - fed_taxable)
             if cfg["irmaa_avoidance"] and age >= 63:
                 conv_room = min(conv_room, max(0.0, irmaa_thr - magi))
             roth_conv_amt = min(conv_room, max(0.0, pt - ptd - cfg["roth_conversion_margin"]))
             if roth_conv_amt > 0:
-                fc = calc_tax(fed_taxable + roth_conv_amt, FEDERAL_BRACKETS, yfb, binfl) - fed_tax
+                fc = calc_tax(fed_taxable + roth_conv_amt, fed_brackets_yr, yfb, binfl) - fed_tax
                 if cfg["oregon_resident"]:
                     # Was a flat 9% guess, inconsistent with the marginal-bracket
                     # approach used for federal (and not matching any actual
@@ -605,14 +830,36 @@ def run_simulation(cfg, return_overrides=None):
         row["Estate_At_Death"] = total_liquid  # what's left in your own accounts if you died this year
         row["Estate_At_Death_Per_Child"] = (total_liquid / n_kids) if n_kids else 0.0
         row["Total_Inheritance_At_Death_Per_Child"] = (row["Family_Net_Worth"] / n_kids) if n_kids else 0.0
+
+        # After-tax value to heirs: not all dollars in the estate are worth
+        # the same to your kids. Inherited pretax accounts (and HSAs, which
+        # follow their own less-favorable rule) must be fully distributed
+        # within 10 years under the SECURE Act and are taxed at the HEIR'S
+        # own bracket -- unlike Roth, which passes tax-free. Cash is already
+        # after-tax since its interest is taxed annually (see Cash_Interest_Taxable).
+        heir_rate = cfg.get("heir_tax_rate", 0.24)
+        pretax_after_tax_to_heirs = pt * (1 - heir_rate)
+        hsa_after_tax_to_heirs = hs * (1 - heir_rate)  # HSAs lose tax-free status entirely for non-spouse heirs
+        row["Heir_Tax_On_PreTax"] = pt * heir_rate
+        row["Heir_Tax_On_HSA"] = hs * heir_rate
+        after_tax_estate = pretax_after_tax_to_heirs + hsa_after_tax_to_heirs + ro + ca
+        row["After_Tax_Estate_At_Death"] = after_tax_estate
+        row["After_Tax_Family_Net_Worth"] = after_tax_estate + legacy_pool  # legacy pool is Roth -- already tax-free
+        row["After_Tax_Estate_Per_Child"] = (after_tax_estate / n_kids) if n_kids else 0.0
+        row["After_Tax_Total_Inheritance_Per_Child"] = (row["After_Tax_Family_Net_Worth"] / n_kids) if n_kids else 0.0
+
         row["Total_Real"] = (total_liquid / (1 + infl) ** yir) if yir > 0 else total_liquid
 
         total_draws = ptd + rod + hsd + cad
         row["Total_Draws"] = total_draws
         row["Withdrawal_Rate"] = total_draws / total_liquid if total_liquid > 0 else 0.0
+        if use_guardrails:
+            if yir == 0:
+                initial_wr = row["Withdrawal_Rate"]
+            prev_wr = row["Withdrawal_Rate"]
 
-        br12 = bracket_ceiling(FEDERAL_BRACKETS, 0.12, yfb, binfl)
-        br22 = bracket_ceiling(FEDERAL_BRACKETS, 0.22, yfb, binfl)
+        br12 = bracket_ceiling(fed_brackets_yr, 0.12, yfb, binfl)
+        br22 = bracket_ceiling(fed_brackets_yr, 0.22, yfb, binfl)
         row["Bracket_12_Ceiling"], row["Bracket_22_Ceiling"] = br12, br22
 
         results.append(row)
@@ -624,17 +871,12 @@ def run_simulation(cfg, return_overrides=None):
 # MONTE CARLO
 # ============================================================
 
-def run_monte_carlo(cfg, n_sims, std_dev, max_up, seed=None):
+def run_monte_carlo(cfg, n_sims, std_dev, max_up, seed=None, correlation=0.85, fat_tailed=False, t_df=5):
     rng = np.random.default_rng(seed)
     num_years = cfg["planning_end_age"] - cfg["retirement_age"] + 1
     all_runs = []
     for _ in range(n_sims):
-        ov = {
-            "pretax": generate_returns(cfg["pretax_return"], std_dev, max_up, num_years, rng),
-            "roth": generate_returns(cfg["roth_return"], std_dev, max_up, num_years, rng),
-            "hsa": generate_returns(cfg["hsa_return"], std_dev, max_up, num_years, rng),
-            "cash": generate_returns(cfg["cash_return"], std_dev / 3, max_up / 2, num_years, rng),
-        }
+        ov = build_mc_return_overrides(cfg, num_years, rng, std_dev, max_up, correlation, fat_tailed, t_df)
         _, df = run_simulation(cfg, return_overrides=ov)
         all_runs.append(df)
     return all_runs
@@ -651,7 +893,7 @@ def compute_percentile_bands(runs, col, pcts=(5, 25, 50, 75, 95)):
 # SCENARIO OPTIMIZER
 # ============================================================
 
-def run_optimizer(base_cfg, mc_sims, mc_std, mc_max, mc_seed):
+def run_optimizer(base_cfg, mc_sims, mc_std, mc_max, mc_seed, correlation=0.85, fat_tailed=False, t_df=5):
     """
     Sweep retirement_age × ss_start_age × expense_reduction_post80
     and find combinations that achieve 100% MC success rate.
@@ -689,12 +931,7 @@ def run_optimizer(base_cfg, mc_sims, mc_std, mc_max, mc_seed):
                 final_real = []
 
                 for _ in range(opt_sims):
-                    ov = {
-                        "pretax": generate_returns(test_cfg["pretax_return"], mc_std, mc_max, num_years, rng),
-                        "roth": generate_returns(test_cfg["roth_return"], mc_std, mc_max, num_years, rng),
-                        "hsa": generate_returns(test_cfg["hsa_return"], mc_std, mc_max, num_years, rng),
-                        "cash": generate_returns(test_cfg["cash_return"], mc_std / 3, mc_max / 2, num_years, rng),
-                    }
+                    ov = build_mc_return_overrides(test_cfg, num_years, rng, mc_std, mc_max, correlation, fat_tailed, t_df)
                     _, sim_df = run_simulation(test_cfg, return_overrides=ov)
                     last = sim_df.iloc[-1]
                     if last["Total_Liquid_Assets"] > 0:
@@ -723,10 +960,73 @@ def run_optimizer(base_cfg, mc_sims, mc_std, mc_max, mc_seed):
 
 
 # ============================================================
+# SENSITIVITY / TORNADO ANALYSIS
+# ============================================================
+
+# (label, cfg_key, mode, delta) -- mode is "additive" (rates/percentages,
+# delta in absolute terms), "multiplicative" (dollar amounts, delta as a
+# fraction), or "additive_int" (whole-number values like age).
+SENSITIVITY_VARS = [
+    ("Retirement Age", "retirement_age", "additive_int", 2),
+    ("PreTax Return", "pretax_return", "additive", 0.015),
+    ("Roth Return", "roth_return", "additive", 0.015),
+    ("HSA Return", "hsa_return", "additive", 0.015),
+    ("Cash/MM Return", "cash_return", "additive", 0.01),
+    ("General Inflation", "inflation_rate", "additive", 0.01),
+    ("Healthcare Inflation", "healthcare_inflation", "additive", 0.02),
+    ("Base Annual Expenses", "base_annual_expenses", "multiplicative", 0.15),
+    ("SS Annual Amount", "ss_annual_amount", "multiplicative", 0.15),
+    ("Legacy Roth/Child/Year", "roth_legacy_per_child", "multiplicative", 0.30),
+]
+
+def run_sensitivity_analysis(cfg, variables=None):
+    """
+    Vary ONE assumption at a time (holding everything else at baseline),
+    re-run the deterministic simulation, and record how much the final-year
+    real (today's-dollar) value moves. Returns a DataFrame sorted by impact
+    magnitude (smallest first, so the biggest driver plots at the top of a
+    horizontal tornado chart), plus the baseline result for reference.
+    """
+    variables = variables or SENSITIVITY_VARS
+    _, base_df = run_simulation(cfg)
+    base_final = base_df["Total_Real"].iloc[-1]
+
+    results = []
+    for label, key, mode, delta in variables:
+        base_val = cfg.get(key)
+        if base_val is None:
+            continue
+        if mode == "additive":
+            lo_val, hi_val = max(0.0, base_val - delta), base_val + delta
+        elif mode == "additive_int":
+            lo_val = max(cfg.get("current_age", 45), int(base_val) - delta)
+            hi_val = min(70, int(base_val) + delta)
+        else:  # multiplicative
+            lo_val, hi_val = base_val * (1 - delta), base_val * (1 + delta)
+
+        _, df_lo = run_simulation({**cfg, key: lo_val})
+        _, df_hi = run_simulation({**cfg, key: hi_val})
+        final_lo = df_lo["Total_Real"].iloc[-1]
+        final_hi = df_hi["Total_Real"].iloc[-1]
+
+        results.append({
+            "Variable": label,
+            "Base_Value": base_val, "Low_Value": lo_val, "High_Value": hi_val,
+            "Low_Result": min(final_lo, final_hi), "High_Result": max(final_lo, final_hi),
+            "Low_Is_High_Input": final_lo > final_hi,  # True if raising the input LOWERS the outcome
+            "Base_Result": base_final,
+            "Impact_Range": abs(final_hi - final_lo),
+        })
+
+    result_df = pd.DataFrame(results).sort_values("Impact_Range", ascending=True).reset_index(drop=True)
+    return result_df, base_final
+
+
+# ============================================================
 # EXCEL EXPORT
 # ============================================================
 
-def export_to_excel(accum_df, retire_df, cfg):
+def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
     """Create a professional Excel workbook with multiple sheets."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, numbers, Border, Side
@@ -812,6 +1112,28 @@ def export_to_excel(accum_df, retire_df, cfg):
         ("RMD Start Age", cfg["rmd_start_age"]),
         ("Roth Conversion Target", cfg["roth_conversion_target_bracket"]),
         ("IRMAA Avoidance", cfg["irmaa_avoidance"]),
+        ("", ""),
+        ("LEGACY POOL & HEIRS (v7)", ""),
+        ("Legacy Pool Target Return", cfg.get("legacy_pool_return", cfg["roth_return"])),
+        ("Legacy Pool Return Std Dev (MC)", cfg.get("legacy_pool_std", "")),
+        ("Assumed Heir Tax Rate (PreTax/HSA)", cfg.get("heir_tax_rate", 0.24)),
+        ("", ""),
+        ("TAX (v7)", ""),
+        ("Tax Cash/MM Interest Annually", cfg.get("tax_cash_interest", True)),
+        ("", ""),
+        ("SPENDING STRATEGY (v7)", ""),
+        ("Strategy", cfg.get("spending_strategy", "fixed")),
+        ("Guardrail Band (\u00b1%)", cfg.get("guardrail_band_pct", "")),
+        ("Guardrail Spending Adjustment (%)", cfg.get("guardrail_adjustment_pct", "")),
+        ("Guardrail Floor (% of plan)", cfg.get("guardrail_floor_pct", "")),
+        ("Guardrail Ceiling (% of plan)", cfg.get("guardrail_ceiling_pct", "")),
+        ("", ""),
+        ("SURVIVING SPOUSE SCENARIO (v7)", ""),
+        ("Model Surviving Spouse Scenario", cfg.get("model_widow_scenario", False)),
+        ("Age of First Death", cfg.get("first_death_age", "") if cfg.get("model_widow_scenario") else "n/a"),
+        ("SS Survivor Benefit Retained", cfg.get("ss_survivor_pct", "") if cfg.get("model_widow_scenario") else "n/a"),
+        ("Pension Survivor Benefit Retained", cfg.get("jss_survivor_pct", "") if cfg.get("model_widow_scenario") else "n/a"),
+        ("Widowhood Expense Reduction", cfg.get("expense_reduction_widowhood", "") if cfg.get("model_widow_scenario") else "n/a"),
     ]
     for r, (label, val) in enumerate(assumptions, 1):
         ws_a.cell(row=r, column=1, value=label).font = Font(name="Arial", bold=label.isupper(), size=11 if label.isupper() else 10)
@@ -848,28 +1170,40 @@ def export_to_excel(accum_df, retire_df, cfg):
     # ──────── Sheet 3: Retirement Phase ────────
     ws_ret = wb.create_sheet("Retirement")
     ret_cols = [
-        "Age", "Year", "Draw_Strategy",
-        "SS_Income", "JSS_Income", "Rental_Income", "S_Plus_Income", "Passive_Income",
-        "PreTax_Draw", "Roth_Draw", "Cash_Draw", "HSA_Draw",
+        "Age", "Year", "Draw_Strategy", "Filing_Status",
+        "SS_Income", "JSS_Income", "JSS_Taxable", "Rental_Income", "Rental_Taxable",
+        "S_Plus_Income", "Passive_Income",
+        "Base_Expenses", "Healthcare_Cost", "HDHP", "Gifts", "Lump_Sum",
+        "Discretionary_Reduction", "Guardrail_Factor",
+        "PreTax_Draw", "Roth_Draw", "Cash_Draw", "HSA_Draw", "Total_Draws",
         "Total_Income", "Total_Expenses", "Total_Tax", "Surplus_Deficit",
+        "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool",
         "PreTax_EOY", "Roth_EOY", "HSA_EOY", "Cash_EOY", "Total_Liquid_Assets", "Total_Real",
+        "Cash_Interest_Taxable",
+        "Gross_Taxable_Income", "Federal_Taxable_Income",
+        "Standard_Deduction", "Itemized_Deduction", "Best_Deduction", "Deduction_Type",
+        "Federal_Tax", "Oregon_Tax",
         "Effective_Tax_Rate", "Withdrawal_Rate",
-        "RMD", "Roth_Conversion", "Roth_Conversion_Tax",
-        "MAGI", "IRMAA_Hit", "IRMAA_Cost",
+        "RMD", "RMD_Excess", "Roth_Conversion", "Roth_Conversion_Tax",
+        "MAGI", "IRMAA_Threshold", "IRMAA_Hit", "IRMAA_Cost",
         "Legacy_Target_Per_Child", "Legacy_Roth_Per_Child", "Legacy_Inheritance_Per_Child",
         "Legacy_Target_Total", "Legacy_Roth_Total", "Legacy_Inheritance_Total", "Legacy_Total",
         "Bad_Return_Year", "Cum_Gifts", "Cum_Legacy_Roth", "Cum_Legacy_Inheritance", "Cum_Lump_Sums",
         "Legacy_Pool_EOY", "Legacy_Pool_Per_Child", "Cum_Legacy_Inheritance_Per_Child",
         "Legacy_Value_To_Date", "Legacy_Value_To_Date_Per_Child",
         "Family_Net_Worth", "Estate_At_Death", "Estate_At_Death_Per_Child", "Total_Inheritance_At_Death_Per_Child",
+        "Heir_Tax_On_PreTax", "Heir_Tax_On_HSA",
+        "After_Tax_Estate_At_Death", "After_Tax_Family_Net_Worth",
+        "After_Tax_Estate_Per_Child", "After_Tax_Total_Inheritance_Per_Child",
     ]
     for c, col in enumerate(ret_cols, 1):
         ws_ret.cell(row=1, column=c, value=col.replace("_", " "))
     style_header(ws_ret, len(ret_cols))
 
-    pct_columns = {"Effective_Tax_Rate", "Withdrawal_Rate"}
-    bool_columns = {"IRMAA_Hit"}
-    text_columns = {"Draw_Strategy"}
+    pct_columns = {"Effective_Tax_Rate", "Withdrawal_Rate", "Guardrail_Factor",
+                   "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool"}
+    bool_columns = {"IRMAA_Hit", "Bad_Return_Year"}
+    text_columns = {"Draw_Strategy", "Filing_Status", "Deduction_Type"}
     neg_fill = PatternFill("solid", fgColor="FFE0E0")
 
     for r, (_, row) in enumerate(retire_df.iterrows(), 2):
@@ -947,6 +1281,48 @@ def export_to_excel(accum_df, retire_df, cfg):
     ws_s.column_dimensions["A"].width = 32
     ws_s.column_dimensions["B"].width = 20
 
+    # ──────── Sheet 5: Monte Carlo (only if MC was run) ────────
+    if mc_runs:
+        ws_mc = wb.create_sheet("Monte Carlo")
+        surv = sum(1 for r in mc_runs if r.iloc[-1]["Total_Liquid_Assets"] > 0)
+        mc_header = [
+            ("MONTE CARLO SUMMARY", ""),
+            ("Simulations", len(mc_runs)),
+            ("Survived (Total_Liquid_Assets > 0 at final age)", surv),
+            ("Success Rate", surv / len(mc_runs)),
+            ("", ""),
+        ]
+        for r, (label, val) in enumerate(mc_header, 1):
+            ws_mc.cell(row=r, column=1, value=label).font = Font(name="Arial", bold=label.isupper(), size=11 if label.isupper() else 10)
+            cell = ws_mc.cell(row=r, column=2, value=val)
+            if isinstance(val, float) and 0 < val < 1:
+                cell.number_format = pct_fmt
+            cell.font = num_font
+
+        start_row = len(mc_header) + 2
+        bands_nom = compute_percentile_bands(mc_runs, "Total_Liquid_Assets")
+        bands_real = compute_percentile_bands(mc_runs, "Total_Real")
+        mc_cols = ["Age", "P5 (Nominal)", "P25 (Nominal)", "P50 Median (Nominal)", "P75 (Nominal)", "P95 (Nominal)",
+                   "P5 (Today's $)", "P25 (Today's $)", "P50 Median (Today's $)", "P75 (Today's $)", "P95 (Today's $)"]
+        for c, col in enumerate(mc_cols, 1):
+            ws_mc.cell(row=start_row, column=c, value=col)
+        style_header_row = ws_mc[start_row]
+        for cell in style_header_row:
+            cell.font = hdr_font
+            cell.fill = hdr_fill
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+
+        ages = bands_nom["Age"]
+        for i, age_val in enumerate(ages):
+            row_vals = [int(age_val),
+                        bands_nom["p5"][i], bands_nom["p25"][i], bands_nom["p50"][i], bands_nom["p75"][i], bands_nom["p95"][i],
+                        bands_real["p5"][i], bands_real["p25"][i], bands_real["p50"][i], bands_real["p75"][i], bands_real["p95"][i]]
+            for c, val in enumerate(row_vals, 1):
+                cell = ws_mc.cell(row=start_row + 1 + i, column=c, value=val)
+                cell.font = num_font
+                cell.number_format = money_k if c > 1 else "0"
+        auto_width(ws_mc)
+
     # Save to buffer
     buf = io.BytesIO()
     wb.save(buf)
@@ -995,6 +1371,17 @@ def main():
             current_age = st.number_input("Current Age", 45, 70, 55)
             retirement_age = st.slider("Retirement Age", 55, 63, 55)
             planning_end = st.slider("Plan Through Age", 85, 100, 89)
+
+        with st.expander("\U0001F5A4 Surviving Spouse Scenario"):
+            st.caption("Models the 'widow's penalty': filing status switches from MFJ to Single the year after the first spouse's death, with smaller brackets/deduction, a partial Social Security survivor benefit, and (optionally) reduced pension and living costs.")
+            widow_scenario = st.checkbox("Model Surviving Spouse Scenario", value=False)
+            if widow_scenario:
+                first_death_age = st.slider("Age of First Spouse's Death", 55, 100, 85)
+                ss_survivor_pct = st.slider("SS Survivor Benefit Retained (%)", 30, 100, 65) / 100
+                jss_survivor_pct = st.slider("Pension Survivor Benefit Retained (%)", 0, 100, 100) / 100
+                exp_red_widow = st.slider("Living Expense Reduction After Widowhood (%)", 0, 50, 20) / 100
+            else:
+                first_death_age, ss_survivor_pct, jss_survivor_pct, exp_red_widow = 999, 0.65, 1.0, 0.0
 
         with st.expander("\U0001F4B0 Current Balances (Today)", expanded=True):
             file_balances, file_loaded = load_starting_balances()
@@ -1050,6 +1437,12 @@ def main():
             mc_std = st.slider("Return Std Dev %", 1.0, 25.0, 12.0, 0.5) / 100
             mc_max = st.slider("Max Upside Cap %", 5.0, 25.0, 18.0, 0.5) / 100
             mc_seed = st.number_input("Seed (0=random)", 0, 99999, 0)
+            st.caption("PreTax/Roth/HSA/Legacy Pool move together each year (same market factor) instead of being drawn fully independently -- more realistic since they typically hold similar underlying investments.")
+            mc_correlation = st.slider("Cross-Account Correlation", 0.0, 1.0, 0.85, 0.05,
+                help="1.0 = all equity-like accounts move in lockstep each year. 0.0 = fully independent (old behavior). Cash/MM always gets a smaller fraction of this (money-market rates track policy rates, not stocks).")
+            mc_fat_tailed = st.checkbox("Fat-Tailed Returns (Student-t)", value=False,
+                help="Real market returns crash harder and more often than a bell curve predicts. Enabling this uses a Student-t distribution instead of Normal, producing more realistic tail risk (more frequent extreme years) at the same target return and std dev.")
+            mc_t_df = st.slider("Fat-Tail Intensity (lower = fatter tails)", 3, 15, 5, 1, disabled=not mc_fat_tailed) if mc_fat_tailed else 5
 
         with st.expander("\U0001F4E5 Income Sources"):
             ss_age = st.slider("SS Start Age", 62, 70, 65)
@@ -1076,7 +1469,25 @@ def main():
             exp_red_80 = st.slider("Expense Reduction After 80 (%)", 0, 25, 25, 5) / 100
             st.caption("Lifestyle slowdown: reduce base expenses after age 80.")
             st.subheader("Negative Return Adjustment")
-            neg_ret_reduction = st.number_input("Discretionary Draw Reduction if Year Return < 0 ($)", 0, 200_000, 20_000, step=1000, format="%d")
+            neg_ret_reduction = st.number_input("Discretionary Draw Reduction if Year Return < 0 (today's $)", 0, 200_000, 20_000, step=1000, format="%d")
+            st.caption("Entered in today's dollars -- inflates every year alongside your base expenses, so a bad year in year 1 and a bad year in year 30 get an equivalent real cut.")
+            st.subheader("Spending Strategy")
+            spending_strategy_choice = st.radio("Strategy", ["Fixed Real Spending", "Dynamic Guardrails (Guyton-Klinger)"], index=0)
+            spending_strategy = "guardrails" if spending_strategy_choice.startswith("Dynamic") else "fixed"
+            if spending_strategy == "guardrails":
+                st.caption("Spending steps down permanently if your withdrawal rate drifts too high above your starting rate, and steps up if it drifts too low -- instead of a fixed inflation-adjusted amount every year.")
+                guardrail_band_pct = st.slider("Guardrail Band (± % of starting withdrawal rate)", 5, 40, 20, 5) / 100
+                guardrail_adjustment_pct = st.slider("Spending Adjustment When Breached (%)", 5, 25, 10, 5) / 100
+                gr_floor_pct, gr_ceiling_pct = st.slider(
+                    "Cumulative Spending Bound (% of original plan)",
+                    30, 200, (90, 150), 5,
+                )
+                guardrail_floor_pct = gr_floor_pct / 100
+                guardrail_ceiling_pct = gr_ceiling_pct / 100
+                st.caption("Caps how far the cumulative guardrail adjustment can drift spending from your original plan, even after many consecutive stressed/flush years -- prevents unrealistic multi-year compounding down to a tiny fraction of your intended budget (or an unrealistically large raise on the upside).")
+            else:
+                guardrail_band_pct, guardrail_adjustment_pct = 0.20, 0.10
+                guardrail_floor_pct, guardrail_ceiling_pct = 0.50, 1.50
             st.subheader("Lump Sum")
             lump_age = st.number_input("Lump at Age", 55, 95, 70)
             lump_amt = st.number_input("Lump Amount ($)", 0, 1_000_000, 0, step=10_000, format="%d")
@@ -1100,11 +1511,18 @@ def main():
             num_kids = st.number_input("Children", 0, 10, 4)
             roth_per_child = st.number_input("Roth/Child/Year ($)", 0, 50_000, 7_500, step=500, format="%d")
             legacy_years = st.slider("Legacy Duration (years)", 1, 20, 20)
+            st.caption("The kids' Roth pool can use its own return/risk profile instead of automatically matching your own Roth account.")
+            legacy_pool_ret = st.slider("Legacy Pool Target Return %", 0.0, 12.0, 7.0, 0.5) / 100
+            legacy_pool_std_pct = st.slider("Legacy Pool Return Std Dev % (Monte Carlo)", 1.0, 25.0, 12.0, 0.5) / 100
+            st.caption("Inherited pretax/HSA accounts must be distributed within 10 years (SECURE Act) and are taxed at the heir's own bracket -- unlike Roth, which passes tax-free. Used for the 'after-tax to heirs' figures on the Legacy tab.")
+            heir_tax_rate = st.slider("Assumed Heir Tax Rate on PreTax/HSA (%)", 0, 45, 24, 1) / 100
 
         with st.expander("\U0001F3DB Tax"):
             or_resident = st.checkbox("Oregon Resident", value=True)
             std_ded = st.number_input("Std Deduction MFJ ($)", 0, 50_000, 32_500, step=100, format="%d")
             bracket_infl = st.slider("Bracket Inflation %", 0.0, 5.0, 2.67, 0.01) / 100
+            tax_cash_int = st.checkbox("Tax Cash/MM Interest Annually (realistic)", value=True,
+                help="Money-market interest is taxed as ordinary income every year, unlike unrealized gains in an equity account. Uncheck to model 'cash' as literal currency instead of an invested account.")
 
         with st.expander("\U0001F4CA Display Options"):
             show_real = st.toggle("Show in Today's Dollars", value=True)
@@ -1128,6 +1546,7 @@ def main():
         expense_reduction_post80=exp_red_80,
         gifts_annual=gifts, lump_sums=lump_sums,
         standard_deduction=std_ded, bracket_inflation=bracket_infl, oregon_resident=or_resident,
+        tax_cash_interest=tax_cash_int,
         rmd_start_age=rmd_start, draw_order=["pretax", "cash", "roth", "hsa"],
         roth_conversion_enabled=roth_conv, roth_conversion_target_bracket=roth_bracket,
         roth_conversion_margin=roth_margin, irmaa_avoidance=irmaa_avoid,
@@ -1135,6 +1554,14 @@ def main():
         neg_ret_draw_reduction=neg_ret_reduction,
         num_children=num_kids, roth_legacy_per_child=roth_per_child,
         legacy_years=legacy_years, legacy_inflation=inflation,
+        legacy_pool_return=legacy_pool_ret, legacy_pool_std=legacy_pool_std_pct,
+        heir_tax_rate=heir_tax_rate,
+        spending_strategy=spending_strategy,
+        guardrail_band_pct=guardrail_band_pct, guardrail_adjustment_pct=guardrail_adjustment_pct,
+        guardrail_floor_pct=guardrail_floor_pct, guardrail_ceiling_pct=guardrail_ceiling_pct,
+        model_widow_scenario=widow_scenario, first_death_age=first_death_age,
+        ss_survivor_pct=ss_survivor_pct, jss_survivor_pct=jss_survivor_pct,
+        expense_reduction_widowhood=exp_red_widow,
     )
 
     # ── RUN ──
@@ -1142,7 +1569,8 @@ def main():
     accum_df = pd.DataFrame(accum_rows) if accum_rows else None
     mc_runs = None
     if mc_enabled:
-        mc_runs = run_monte_carlo(cfg, mc_sims, mc_std, mc_max, seed=mc_seed if mc_seed > 0 else None)
+        mc_runs = run_monte_carlo(cfg, mc_sims, mc_std, mc_max, seed=mc_seed if mc_seed > 0 else None,
+                                   correlation=mc_correlation, fat_tailed=mc_fat_tailed, t_df=mc_t_df)
 
     # ── DEFLATOR (today's dollars conversion) ──
     # When show_real is True, deflate future dollar amounts back to present value
@@ -1208,6 +1636,7 @@ def main():
                  "\U0001F381 Legacy", "\U0001F3DB Tax", "\U0001F504 Roth Conversions"]
     if mc_runs: tab_names.append("\U0001F3B2 Monte Carlo")
     if mc_runs: tab_names.append("\U0001F3AF Optimizer")
+    tab_names.append("\U0001F32A Sensitivity")
     tab_names.append("\U0001F4CB Full Data")
     tabs = st.tabs(tab_names)
     ti = 0
@@ -1500,7 +1929,8 @@ def main():
 
             if st.button("Run Optimizer", type="primary"):
                 with st.spinner("Running scenario sweep (this takes a moment)..."):
-                    opt_df = run_optimizer(cfg, mc_sims, mc_std, mc_max, mc_seed)
+                    opt_df = run_optimizer(cfg, mc_sims, mc_std, mc_max, mc_seed,
+                                            correlation=mc_correlation, fat_tailed=mc_fat_tailed, t_df=mc_t_df)
 
                 # ── Current scenario baseline ──
                 surv = sum(1 for r in mc_runs if r.iloc[-1]["Total_Liquid_Assets"] > 0)
@@ -1552,6 +1982,54 @@ def main():
                 )
         ti += 1
 
+    # ── Sensitivity Tab ──
+    with tabs[ti]:
+        st.subheader("\U0001F32A Sensitivity (Tornado) Analysis")
+        st.caption(
+            "Varies ONE assumption at a time -- holding everything else at your current "
+            "settings -- and shows how much your final-year value (today's $) moves. Sorted "
+            "so the biggest driver of your outcome is at the top."
+        )
+        if st.button("Run Sensitivity Analysis", type="primary"):
+            with st.spinner("Running sensitivity sweep..."):
+                sens_df, base_final = run_sensitivity_analysis(cfg)
+
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                y=sens_df["Variable"], x=sens_df["High_Result"] - sens_df["Low_Result"],
+                base=sens_df["Low_Result"], orientation="h",
+                marker_color="rgba(99,110,250,0.6)",
+                text=[f"${lo:,.0f} \u2192 ${hi:,.0f}" for lo, hi in zip(sens_df["Low_Result"], sens_df["High_Result"])],
+                textposition="inside", insidetextanchor="middle",
+            ))
+            fig.add_vline(x=base_final, line_dash="dash", line_color="black")
+            fig.update_layout(
+                title=f"Impact on Final-Year Value ({dollar_label}) \u2014 Baseline: ${base_final:,.0f}",
+                xaxis_title=dollar_label, xaxis_tickformat="$,.0f",
+                height=120 + 45 * len(sens_df), margin=dict(l=10),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("**Range tested per variable** (\u00b1 around your current setting):")
+            disp_sens = sens_df[["Variable", "Low_Value", "Base_Value", "High_Value",
+                                  "Low_Result", "High_Result", "Impact_Range"]].copy()
+            for c in ["Low_Result", "High_Result", "Impact_Range"]:
+                disp_sens[c] = disp_sens[c].apply(lambda x: f"${x:,.0f}")
+            for c in ["Low_Value", "Base_Value", "High_Value"]:
+                disp_sens[c] = disp_sens[c].apply(
+                    lambda x: f"{x:.1%}" if isinstance(x, float) and abs(x) < 1 else f"{x:,.0f}"
+                )
+            st.dataframe(disp_sens.iloc[::-1], use_container_width=True, hide_index=True)
+            st.caption(
+                "Note: Retirement Age and Base Annual Expenses change the shape of the whole "
+                "plan (years worked, years drawing down), so their bars aren't perfectly "
+                "apples-to-apples with pure return/rate assumptions -- but the ranking still "
+                "tells you where a planning decision matters most."
+            )
+        else:
+            st.info("Click **Run Sensitivity Analysis** to see which assumptions matter most to your outcome.")
+        ti += 1
+
     # ── Full Data Tab ──
     with tabs[ti]:
         st.caption(f"Displaying in **{dollar_label}**")
@@ -1586,7 +2064,7 @@ def main():
         with col_dl1:
             st.download_button("\U0001F4E5 Download CSV", df.to_csv(index=False), "retirement_plan.csv", "text/csv")
         with col_dl2:
-            xlsx_buf = export_to_excel(accum_df, df, cfg)
+            xlsx_buf = export_to_excel(accum_df, df, cfg, mc_runs=mc_runs)
             st.download_button("\U0001F4E5 Download Excel Report", xlsx_buf,
                                "retirement_plan.xlsx",
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1599,13 +2077,21 @@ def main():
 
 **Draw Strategy:** Pre-RMD: PreTax up to 12% bracket → Cash → Roth → HSA. RMD Phase (75+): mandatory RMD first → Cash → Roth → HSA. Roth conversions fill remaining bracket space.
 
-**Monte Carlo:** Returns ~ N(target, std_dev), capped at max upside. Cash uses 1/3 std dev.
+**Monte Carlo:** Returns ~ N(target, std_dev) by default, or Student-t if Fat-Tailed is enabled, capped at max upside. PreTax/Roth/HSA/Legacy Pool share a common market factor (Cross-Account Correlation slider); Cash/MM gets a smaller fraction of it and 1/3 the std dev.
 
-**Legacy Gifting:** In a year with positive/neutral returns, the target Roth gift is withdrawn once (via the normal draw waterfall) and credited to the Roth balance. In a down-market year, the gift is skipped entirely and the target amount simply stays invested — it isn't withdrawn, and "Legacy Inheritance" is a label for that still-invested amount, not a separate pot of money.
+**Legacy Gifting:** In a year with positive/neutral returns, the target Roth gift is withdrawn once (via the normal draw waterfall) and credited to a segregated Legacy Pool balance that compounds on its own return/std-dev assumption and is never drawn back down for household spending. In a down-market year, the gift is skipped entirely and the target amount simply stays invested — it isn't withdrawn, and "Legacy Inheritance" is a label for that still-invested amount, not a separate pot of money.
+
+**After-Tax to Heirs:** Inherited pretax/HSA balances must be distributed within 10 years (SECURE Act) and are taxed at an assumed heir rate; Roth (including the Legacy Pool) passes tax-free. The Legacy tab shows both nominal and after-tax figures since a dollar in each bucket is not worth the same to your heirs.
+
+**Surviving Spouse Scenario:** When enabled, filing status switches from MFJ to Single starting the year after the configured death age (the IRS allows MFJ in the year of death itself), pulling in single-filer federal brackets, a halved standard deduction, a halved IRMAA threshold, single Social Security taxability thresholds, and a configurable partial SS survivor benefit, pension survivor benefit, and living-expense reduction.
+
+**Spending Strategy:** Fixed Real Spending (default) inflates your base expenses every year. Dynamic Guardrails (Guyton-Klinger style) instead compares last year's withdrawal rate to a band around your starting rate and applies a permanent step up/down in spending when breached.
 
 **Cash Shortfalls:** Cash is allowed to go negative to represent a genuine funding gap; it is not floored to $0, so Total_Liquid_Assets and Monte Carlo success rates reflect real shortfalls rather than hiding them.
 
-**Excel Export:** 4-sheet workbook: Assumptions, Accumulation, Retirement, Summary.
+**Discretionary Reduction:** The "if Year Return < 0" cut is entered in today's dollars and inflates every year alongside base expenses, so it represents an equivalent real cut whether a bad year hits early or late in the plan.
+
+**Excel Export:** 4-sheet workbook: Assumptions, Accumulation, Retirement, Summary -- plus a 5th Monte Carlo sheet (percentile bands + success rate) whenever Monte Carlo is enabled.
         """)
 
 
