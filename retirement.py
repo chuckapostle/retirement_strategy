@@ -1480,7 +1480,7 @@ def main():
                 guardrail_adjustment_pct = st.slider("Spending Adjustment When Breached (%)", 5, 25, 10, 5) / 100
                 gr_floor_pct, gr_ceiling_pct = st.slider(
                     "Cumulative Spending Bound (% of original plan)",
-                    30, 200, (90, 150), 5,
+                    30, 200, (50, 150), 5,
                 )
                 guardrail_floor_pct = gr_floor_pct / 100
                 guardrail_ceiling_pct = gr_ceiling_pct / 100
@@ -2001,6 +2001,7 @@ def main():
                 marker_color="rgba(99,110,250,0.6)",
                 text=[f"${lo:,.0f} \u2192 ${hi:,.0f}" for lo, hi in zip(sens_df["Low_Result"], sens_df["High_Result"])],
                 textposition="inside", insidetextanchor="middle",
+                textfont=dict(color="white"),
             ))
             fig.add_vline(x=base_final, line_dash="dash", line_color="black")
             fig.update_layout(
