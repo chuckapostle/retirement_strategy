@@ -47,7 +47,7 @@ def make_cfg(**overrides):
         heir_tax_rate=0.24,
         spending_strategy="fixed",
         guardrail_band_pct=0.20, guardrail_adjustment_pct=0.10,
-        guardrail_floor_pct=0.90, guardrail_ceiling_pct=1.50,
+        guardrail_floor_pct=0.60, guardrail_ceiling_pct=1.50,
         model_widow_scenario=False, first_death_age=999,
         ss_survivor_pct=0.65, jss_survivor_pct=1.0,
         expense_reduction_widowhood=0.0,

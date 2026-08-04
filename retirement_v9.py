@@ -7,6 +7,14 @@ Usage:
   pip install streamlit plotly pandas numpy openpyxl
   streamlit run retirement_v9.py
 
+v12 default tuning (UI starting values, no engine/behavior changes):
+  Annual Cash Savings 150k->40k, Final Year Cash Lump 120k->0, Brokerage
+  Annual Contribution 0->200k, Fat-Tailed Returns off->on, Absolute
+  Minimum Annual Expenses 0->145k, Spending Strategy Fixed->Dynamic
+  Guardrails, Cumulative Spending Bound 90-150%->60-150%, Enable Roth
+  Conversions off->on. Every one of these remains user-adjustable in the
+  sidebar; only the value shown on first load changed.
+
 v11 fix (guardrail floor was not actually a floor):
 1. The v10 Inflation Rule applied via a separate, unbounded freeze on the
 spending base, independent of Guardrail_Factor's floor/ceiling clamp.
@@ -653,7 +661,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
             # below guardrail_floor_pct or above guardrail_ceiling_pct of
             # the plan's original (uninflated) spending level, no matter how
             # many consecutive breach/down years compound.
-            guardrail_floor = cfg.get("guardrail_floor_pct", 0.90)
+            guardrail_floor = cfg.get("guardrail_floor_pct", 0.60)
             guardrail_ceiling = cfg.get("guardrail_ceiling_pct", 1.50)
             guardrail_factor = min(max(guardrail_factor, guardrail_floor), guardrail_ceiling)
         row["Guardrail_Factor"] = guardrail_factor
@@ -1745,8 +1753,8 @@ def main():
             c_mega = st.number_input("Mega Backdoor Roth ($)", 0, 50_000, 29_000, step=1_000, format="%d")
             c_match = st.number_input("Employer Match ($)", 0, 50_000, 18_000, step=1_000, format="%d")
             st.divider()
-            c_cash = st.number_input("Annual Cash Savings ($)", 0, 500_000, 150_000, step=5_000, format="%d")
-            c_cash_lump = st.number_input("Final Year Cash Lump ($)", 0, 500_000, 120_000, step=10_000, format="%d")
+            c_cash = st.number_input("Annual Cash Savings ($)", 0, 500_000, 40_000, step=5_000, format="%d")
+            c_cash_lump = st.number_input("Final Year Cash Lump ($)", 0, 500_000, 0, step=10_000, format="%d")
             st.divider()
             brokerage_basis_pct = st.slider(
                 "Brokerage Starting Cost Basis (% of balance)", 0, 100, 100, 5,
@@ -1755,7 +1763,7 @@ def main():
                      "holds unrealized gains.",
             )
             brokerage_basis = brokerage_bal * brokerage_basis_pct / 100
-            c_brokerage = st.number_input("Brokerage Annual Contribution ($)", 0, 200_000, 0, step=5_000, format="%d")
+            c_brokerage = st.number_input("Brokerage Annual Contribution ($)", 0, 200_000, 200_000, step=5_000, format="%d")
 
         with st.expander("\U0001F4C8 Performance Assumptions"):
             pretax_ret = st.slider("PreTax Target Return %", 0.0, 12.0, 6.0, 0.5) / 100
@@ -1774,7 +1782,7 @@ def main():
             st.caption("PreTax/Roth/HSA/Legacy Pool move together each year (same market factor) instead of being drawn fully independently -- more realistic since they typically hold similar underlying investments.")
             mc_correlation = st.slider("Cross-Account Correlation", 0.0, 1.0, 0.85, 0.05,
                 help="1.0 = all equity-like accounts move in lockstep each year. 0.0 = fully independent (old behavior). Cash/MM always gets a smaller fraction of this (money-market rates track policy rates, not stocks).")
-            mc_fat_tailed = st.checkbox("Fat-Tailed Returns (Student-t)", value=False,
+            mc_fat_tailed = st.checkbox("Fat-Tailed Returns (Student-t)", value=True,
                 help="Real market returns crash harder and more often than a bell curve predicts. Enabling this uses a Student-t distribution instead of Normal, producing more realistic tail risk (more frequent extreme years) at the same target return and std dev.")
             mc_t_df = st.slider("Fat-Tail Intensity (lower = fatter tails)", 3, 15, 5, 1, disabled=not mc_fat_tailed) if mc_fat_tailed else 5
 
@@ -1807,7 +1815,7 @@ def main():
             st.caption("Entered in today's dollars -- inflates every year alongside your base expenses, so a bad year in year 1 and a bad year in year 30 get an equivalent real cut.")
             st.subheader("Absolute Survival Floor")
             absolute_min_expenses = st.number_input(
-                "Absolute Minimum Annual Expenses (today's $)", 0, 200_000, 0, step=5_000, format="%d",
+                "Absolute Minimum Annual Expenses (today's $)", 0, 200_000, 145_000, step=5_000, format="%d",
                 help="A hard floor on base spending that no reduction below -- post-80 slowdown, "
                      "widowhood, or the guardrails/Inflation Rule cuts -- can push below, no matter "
                      "how many bad years compound. Distinct from the Cumulative Spending Bound "
@@ -1816,7 +1824,7 @@ def main():
                      "may not be livable. 0 = off (no absolute floor).",
             )
             st.subheader("Spending Strategy")
-            spending_strategy_choice = st.radio("Strategy", ["Fixed Real Spending", "Dynamic Guardrails (Guyton-Klinger)"], index=0)
+            spending_strategy_choice = st.radio("Strategy", ["Fixed Real Spending", "Dynamic Guardrails (Guyton-Klinger)"], index=1)
             spending_strategy = "guardrails" if spending_strategy_choice.startswith("Dynamic") else "fixed"
             if spending_strategy == "guardrails":
                 st.caption("Spending steps down permanently if your withdrawal rate drifts too high above your starting rate, and steps up if it drifts too low -- instead of a fixed inflation-adjusted amount every year.")
@@ -1824,16 +1832,16 @@ def main():
                 guardrail_adjustment_pct = st.slider("Spending Adjustment When Breached (%)", 5, 25, 10, 5) / 100
                 gr_floor_pct, gr_ceiling_pct = st.slider(
                     "Cumulative Spending Bound (% of original plan)",
-                    30, 200, (90, 150), 5,
+                    30, 200, (60, 150), 5,
                 )
                 guardrail_floor_pct = gr_floor_pct / 100
                 guardrail_ceiling_pct = gr_ceiling_pct / 100
-                st.caption("Caps how far the cumulative guardrail adjustment (both the withdrawal-rate rule AND the Inflation Rule below, combined) can drift spending from your original plan, even after many consecutive stressed/flush years -- prevents unrealistic multi-year compounding down to a tiny fraction of your intended budget (or an unrealistically large raise on the upside). Default of 90% is deliberately tight: it limits the combined cut to about one adjustment step before the floor engages, favoring spending stability over portfolio-survival optics -- loosen it if you want more room for the strategy to actually flex.")
+                st.caption("Caps how far the cumulative guardrail adjustment (both the withdrawal-rate rule AND the Inflation Rule below, combined) can drift spending from your original plan, even after many consecutive stressed/flush years -- prevents unrealistic multi-year compounding down to a tiny fraction of your intended budget (or an unrealistically large raise on the upside). A 60% floor leaves real room for the strategy to flex before the Absolute Minimum Annual Expenses floor (above) takes over as the true backstop -- tighten it if you'd rather the % bound do more of that work itself.")
                 guardrail_inflation_rule = st.checkbox("Apply Inflation Rule (skip COLA after a down year)", value=True,
                     help="The third classic Guyton-Klinger rule: cancel that year's COLA (instead of applying it) following a negative portfolio return. Folded into the same bounded Guardrail Factor as the withdrawal-rate rule above, so the Cumulative Spending Bound applies to their combined effect.")
             else:
                 guardrail_band_pct, guardrail_adjustment_pct = 0.20, 0.10
-                guardrail_floor_pct, guardrail_ceiling_pct = 0.90, 1.50
+                guardrail_floor_pct, guardrail_ceiling_pct = 0.60, 1.50
                 guardrail_inflation_rule = True
             st.subheader("Lump Sum")
             lump_age = st.number_input("Lump at Age", 55, 95, 70)
@@ -1848,7 +1856,7 @@ def main():
             rmd_start = st.slider("RMD Start Age", 73, 75, 75)
             perf_only = st.checkbox("Performance Draw Only", value=False)
             st.divider()
-            roth_conv = st.checkbox("Enable Roth Conversions", value=False)
+            roth_conv = st.checkbox("Enable Roth Conversions", value=True)
             roth_bracket = st.selectbox("Conversion Target", ["12%", "22%"])
             roth_margin = st.number_input("Min PreTax Keep ($)", 0, 1_000_000, 100_000, step=25_000, format="%d")
             st.divider()
