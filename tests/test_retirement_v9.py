@@ -198,7 +198,105 @@ def test_run_simulation_smoke_and_regression_pin():
 
 def test_run_accumulation_smoke():
     cfg = make_cfg(current_age=55, retirement_age=61)
-    rows, pt, ro, hs, ca, s5, s10 = rv.run_accumulation(cfg)
+    rows, pt, ro, hs, ca, s5, s10, bk, bk_basis = rv.run_accumulation(cfg)
     assert len(rows) == 6
     assert pt > cfg["pretax_401k"]  # grew + received contributions
     assert all(r["Age"] == cfg["current_age"] + i for i, r in enumerate(rows))
+    assert bk == 0.0 and bk_basis == 0.0  # no brokerage balance configured
+
+
+# ============================================================
+# Taxable brokerage bucket (Phase 2)
+# ============================================================
+
+def test_brokerage_draw_realizes_pro_rated_gain_and_reduces_basis():
+    """Isolated, hand-verifiable case: a single retirement year, every other
+    bucket at $0, so the whole expense need is forced through the brokerage
+    account. 100,000 balance / 40,000 basis = 60% embedded gain; a 30,000
+    draw should realize 18,000 of gain and remove 12,000 of basis."""
+    cfg = make_cfg(
+        current_age=61, retirement_age=61, planning_end_age=61,
+        pretax_401k=0, roth_ira=0, hsa=0, cash=0,
+        s_plus_5yr=0, s_plus_10yr=0,
+        brokerage=100_000, brokerage_basis=40_000,
+        ss_annual_amount=0, jss_annual_amount=0, rental_gross=0,
+        gifts_annual=0, base_annual_expenses=30_000,
+        healthcare_pre_medicare=0, healthcare_post_medicare=0, hdhp_annual=0,
+        num_children=0,
+    )
+    _, df = rv.run_simulation(cfg)
+    row = df.iloc[0]
+    assert row["Brokerage_Draw"] == pytest.approx(30_000.0)
+    assert row["Brokerage_LTCG_Gain"] == pytest.approx(18_000.0)
+    assert row["Brokerage_EOY"] == pytest.approx(70_000.0)
+    assert row["Brokerage_Basis"] == pytest.approx(28_000.0)
+
+
+def test_brokerage_basis_never_exceeds_balance_over_many_years():
+    cfg = make_cfg(
+        planning_end_age=90, brokerage=150_000, brokerage_basis=150_000,
+        brokerage_return=0.06, cash=0, pretax_401k=200_000, roth_ira=50_000,
+    )
+    _, df = rv.run_simulation(cfg)
+    assert (df["Brokerage_Basis"] <= df["Brokerage_EOY"] + 1e-6).all()
+    assert (df["Brokerage_Basis"] >= 0).all()
+
+
+def test_calc_ltcg_tax_zero_when_stack_stays_in_zero_bracket():
+    # 50,000 ordinary + 20,000 gain = 70,000, entirely under the MFJ 0% LTCG
+    # threshold (96,700) -- no federal LTCG tax at all.
+    assert rv.calc_ltcg_tax(20_000, 50_000, rv.LTCG_BRACKETS, 0, 0.0) == 0.0
+
+
+def test_calc_ltcg_tax_splits_across_the_0pct_and_15pct_brackets():
+    # 90,000 ordinary + 20,000 gain = 110,000: the first 6,700 of gain fills
+    # the remaining 0% room (up to 96,700), the other 13,300 falls in the 15%
+    # bracket -- tax = 13,300 * 0.15 = 1,995.
+    tax = rv.calc_ltcg_tax(20_000, 90_000, rv.LTCG_BRACKETS, 0, 0.0)
+    assert tax == pytest.approx(1_995.0)
+
+
+def test_calc_ltcg_tax_zero_for_nonpositive_gain():
+    assert rv.calc_ltcg_tax(0, 50_000, rv.LTCG_BRACKETS, 0, 0.0) == 0.0
+    assert rv.calc_ltcg_tax(-100, 50_000, rv.LTCG_BRACKETS, 0, 0.0) == 0.0
+
+
+# ============================================================
+# Guyton-Klinger Inflation Rule (Phase 2)
+# ============================================================
+
+def test_guardrail_inflation_rule_freezes_cola_the_year_after_a_down_year():
+    """guardrail_band_pct=100 makes the WR-based capital-preservation/
+    prosperity rule un-triggerable (no realistic withdrawal rate will ever
+    breach a +/-100x band), isolating the Inflation Rule as the only thing
+    that can move Base_Expenses away from a plain compounding series."""
+    cfg = make_cfg(
+        planning_end_age=65, spending_strategy="guardrails",
+        guardrail_band_pct=100.0, guardrail_inflation_rule=True,
+        inflation_rate=0.03,
+    )
+    n = cfg["planning_end_age"] - cfg["retirement_age"] + 1
+    returns = np.full(n, 0.06)
+    returns[1] = -0.10  # bad return in the 2nd simulated year (index 1)
+    overrides = {k: returns.copy() for k in ["pretax", "roth", "hsa", "cash", "legacy_pool", "brokerage"]}
+    _, df = rv.run_simulation(cfg, return_overrides=overrides)
+
+    assert df["Guardrail_Factor"].eq(1.0).all()  # confirms the WR-based rule never fired
+    assert df["Inflation_Frozen"].tolist() == [False, False, True, False, False]
+
+    base, infl = cfg["base_annual_expenses"], cfg["inflation_rate"]
+    assert df["Base_Expenses"].iloc[0] == pytest.approx(base)
+    assert df["Base_Expenses"].iloc[1] == pytest.approx(base * (1 + infl))
+    assert df["Base_Expenses"].iloc[2] == pytest.approx(base * (1 + infl))  # frozen: same as year 1
+    assert df["Base_Expenses"].iloc[3] == pytest.approx(base * (1 + infl) ** 2)  # resumes compounding
+
+
+def test_fixed_spending_unaffected_by_inflation_rule_toggle():
+    """guardrail_inflation_rule only has teeth when spending_strategy is
+    'guardrails' -- Fixed Real Spending must inflate every year regardless."""
+    cfg = make_cfg(spending_strategy="fixed", guardrail_inflation_rule=True)
+    _, df = rv.run_simulation(cfg)
+    assert not df["Inflation_Frozen"].any()
+    base, infl = cfg["base_annual_expenses"], cfg["inflation_rate"]
+    expected = [base * (1 + infl) ** i for i in range(len(df))]
+    assert df["Base_Expenses"].tolist() == pytest.approx(expected)

@@ -163,6 +163,18 @@ OREGON_BRACKETS = [
 # Oregon's single-vs-MFJ bracket differences are much smaller than federal's;
 # OREGON_BRACKETS is used for both filing statuses as a documented simplification.
 
+# Long-term capital gains brackets. Federal only -- Oregon has no
+# preferential capital-gains rate (gains are taxed as ordinary income under
+# OREGON_BRACKETS, same as everything else). Approximate current-law
+# figures; like the ordinary brackets above, these need an annual refresh
+# (see TAX_YEAR / verify_tax_constants below).
+LTCG_BRACKETS = [
+    (0.00, 96_700), (0.15, 600_050), (0.20, float("inf")),
+]
+SINGLE_LTCG_BRACKETS = [
+    (0.00, 48_350), (0.15, 533_400), (0.20, float("inf")),
+]
+
 # ============================================================
 # TAX ENGINE
 # ============================================================
@@ -175,6 +187,23 @@ def calc_tax(taxable, brackets, yrs, infl):
         band = max(0.0, min(taxable, ac) - prev)
         tax += band * rate; prev = ac
         if taxable <= ac: break
+    return tax
+
+def calc_ltcg_tax(gain, ordinary_taxable, ltcg_brackets, yrs, infl):
+    """Long-term capital gains tax under the IRS 'stacked on top of ordinary
+    income' method (the Qualified Dividends and Capital Gain Tax Worksheet):
+    the gain occupies bracket space starting where ordinary_taxable already
+    fills up to, using the LTCG bracket thresholds -- so other ordinary
+    income (e.g. a Roth conversion) stacked below it can push the gain into
+    a higher LTCG bracket, same as in real life."""
+    if gain <= 0: return 0.0
+    tax, prev = 0.0, 0.0
+    stack_top = ordinary_taxable + gain
+    for rate, ceil in ltcg_brackets:
+        ac = ceil * (1 + infl) ** yrs if ceil != float("inf") else float("inf")
+        band = max(0.0, min(stack_top, ac) - max(prev, ordinary_taxable))
+        tax += band * rate; prev = ac
+        if stack_top <= ac: break
     return tax
 
 def bracket_ceiling(brackets, target_rate, yrs, infl):
@@ -245,6 +274,8 @@ def build_mc_return_overrides(cfg, num_years, rng, std_dev, max_up, correlation=
         "hsa": (cfg["hsa_return"], std_dev, max_up),
         "legacy_pool": (cfg.get("legacy_pool_return", cfg["roth_return"]),
                          cfg.get("legacy_pool_std", std_dev), max_up),
+        "brokerage": (cfg.get("brokerage_return", cfg["roth_return"]),
+                       cfg.get("brokerage_std", std_dev), max_up),
     }
     ov = generate_correlated_returns(bucket_specs, num_years, rng, correlation, fat_tailed, t_df)
     # Cash/MM: much lower volatility, only lightly correlated with the
@@ -264,6 +295,7 @@ def load_starting_balances(path="starting_balances.txt"):
         "s_plus_5": None,
         "s_plus_10": None,
         "cash": None,
+        "brokerage": None,
     }
     if not Path(path).exists():
         return defaults, False
@@ -282,6 +314,9 @@ def load_starting_balances(path="starting_balances.txt"):
         "s10": "s_plus_10",
         "s_plus_10": "s_plus_10",
         "cash": "cash",
+        "brokerage": "brokerage",
+        "taxable": "brokerage",
+        "taxablebrokerage": "brokerage",
     }
     loaded = False
     try:
@@ -314,8 +349,14 @@ def run_accumulation(cfg):
     ret_age = cfg["retirement_age"]
     base_year = CURRENT_YEAR
     years = ret_age - cur_age
+    bk0 = float(cfg.get("brokerage", 0.0))
+    # Starting cost basis defaults to the starting balance (no embedded gain
+    # assumed at t=0) but is overridable for an account that already has
+    # unrealized gains today.
+    bk_basis0 = float(cfg.get("brokerage_basis", bk0))
     if years <= 0:
-        return [], cfg["pretax_401k"], cfg["roth_ira"], cfg["hsa"], cfg["cash"], cfg["s_plus_5yr"], cfg["s_plus_10yr"]
+        return ([], cfg["pretax_401k"], cfg["roth_ira"], cfg["hsa"], cfg["cash"],
+                cfg["s_plus_5yr"], cfg["s_plus_10yr"], bk0, bk_basis0)
 
     pt = float(cfg["pretax_401k"])
     ro = float(cfg["roth_ira"])
@@ -323,6 +364,8 @@ def run_accumulation(cfg):
     ca = float(cfg["cash"])
     s5 = float(cfg["s_plus_5yr"])
     s10 = float(cfg["s_plus_10yr"])
+    bk = bk0
+    bk_basis = bk_basis0
 
     # Annual contributions
     c_401k = cfg.get("contrib_401k", 24_500)
@@ -333,12 +376,14 @@ def run_accumulation(cfg):
     c_employer_match = cfg.get("contrib_employer_match", 18_000)
     c_cash_annual = cfg.get("contrib_cash_annual", 150_000)
     c_cash_final_lump = cfg.get("contrib_cash_final_lump", 120_000)
+    c_brokerage_annual = cfg.get("contrib_brokerage_annual", 0)
 
     # Growth rates (same as retirement performance assumptions)
     pr_pt = cfg["pretax_return"]
     pr_ro = cfg["roth_return"]
     pr_hs = cfg["hsa_return"]
     pr_ca = cfg["cash_return"]
+    pr_bk = cfg.get("brokerage_return", pr_ro)
 
     rows = []
     for i in range(years):
@@ -351,15 +396,19 @@ def run_accumulation(cfg):
             ro *= (1 + pr_ro)
             hs *= (1 + pr_hs)
             ca *= (1 + pr_ca)
+            bk *= (1 + pr_bk)  # basis is untouched by growth
             # S+ grows in deferred comp while employed
             s5 *= (1 + pr_pt)
             s10 *= (1 + pr_pt)
 
-        # Contributions (end of year)
+        # Contributions (end of year) -- brokerage contributions add 1:1 to
+        # both balance and basis (no gain on money that was just contributed)
         pt += c_401k + c_employer_match
         ro += c_roth401k + c_roth_ira * 2 + c_mega_backdoor  # 2x Roth IRA for MFJ
         hs += c_hsa
         ca += c_cash_annual
+        bk += c_brokerage_annual
+        bk_basis += c_brokerage_annual
 
         # Final year lump sum
         if i == years - 1:
@@ -369,15 +418,17 @@ def run_accumulation(cfg):
             "Phase": "Accumulation",
             "Age": age, "Year": yr,
             "PreTax_EOY": pt, "Roth_EOY": ro, "HSA_EOY": hs, "Cash_EOY": ca,
+            "Brokerage_EOY": bk, "Brokerage_Basis": bk_basis,
             "S_Plus_5yr": s5, "S_Plus_10yr": s10,
             "Contrib_PreTax": c_401k + c_employer_match,
             "Contrib_Roth": c_roth401k + c_roth_ira * 2 + c_mega_backdoor,
             "Contrib_HSA": c_hsa,
             "Contrib_Cash": c_cash_annual + (c_cash_final_lump if i == years - 1 else 0),
-            "Total_Liquid_Assets": pt + ro + hs + ca,
+            "Contrib_Brokerage": c_brokerage_annual,
+            "Total_Liquid_Assets": pt + ro + hs + ca + bk,
         })
 
-    return rows, pt, ro, hs, ca, s5, s10
+    return rows, pt, ro, hs, ca, s5, s10, bk, bk_basis
 
 
 # ============================================================
@@ -403,7 +454,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
     # every single call (run_monte_carlo, run_optimizer both do this).
     if accum_result is None:
         accum_result = run_accumulation(cfg)
-    accum_rows, pt, ro, hs, ca, s5_bal, s10_bal = accum_result
+    accum_rows, pt, ro, hs, ca, s5_bal, s10_bal, bk, bk_basis = accum_result
     cash_basis = float(accum_rows[-1].get("Cash_Basis", cfg["cash"])) if accum_rows else float(cfg["cash"])
 
     # S+ payout tracking
@@ -434,6 +485,19 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
     initial_wr = None
     prev_wr = None
 
+    # Guyton-Klinger "Inflation Rule": skip the inflation increase on base
+    # spending in a year following a negative portfolio return (freeze
+    # nominal spending flat instead of applying that year's COLA). This
+    # needs an iteratively-tracked running nominal base rather than the
+    # closed-form base_annual_expenses*(1+infl)**yir, since "skip this one
+    # year" can't be expressed as a pure power formula. Gated behind
+    # guardrails, so base_exp_running collapses to the exact same value as
+    # the old closed form (and Fixed Real Spending is byte-for-byte
+    # unchanged) whenever the freeze never triggers.
+    use_guardrail_inflation_rule = use_guardrails and cfg.get("guardrail_inflation_rule", True)
+    base_exp_running = float(cfg["base_annual_expenses"])
+    prev_year_negative_return = False
+
     for idx in range(num_years):
         age = ret_age + idx
         yr = ret_year + idx
@@ -449,6 +513,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         is_widowed = bool(cfg.get("model_widow_scenario", False)) and age > cfg.get("first_death_age", 999)
         row["Filing_Status"] = "Single (Widowed)" if is_widowed else "MFJ"
         fed_brackets_yr = SINGLE_FEDERAL_BRACKETS if is_widowed else FEDERAL_BRACKETS
+        ltcg_brackets_yr = SINGLE_LTCG_BRACKETS if is_widowed else LTCG_BRACKETS
         std_ded_multiplier = 0.5 if is_widowed else 1.0  # single standard deduction is ~half of MFJ's
         irmaa_threshold_base = IRMAA_MAGI_THRESHOLD_SINGLE if is_widowed else IRMAA_MAGI_THRESHOLD
 
@@ -488,9 +553,11 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
             r_pt, r_ro = return_overrides["pretax"][yir], return_overrides["roth"][yir]
             r_hs, r_ca = return_overrides["hsa"][yir], return_overrides["cash"][yir]
             r_lp = return_overrides["legacy_pool"][yir] if "legacy_pool" in return_overrides else r_ro
+            r_bk = return_overrides["brokerage"][yir] if "brokerage" in return_overrides else r_ro
         else:
             r_pt, r_ro, r_hs, r_ca = pr_pt, pr_ro, pr_hs, pr_ca
             r_lp = cfg.get("legacy_pool_return", pr_ro)
+            r_bk = cfg.get("brokerage_return", pr_ro)
 
         # Snapshot the pretax balance as of the *prior* year-end, before this
         # year's growth is applied — RMDs are legally based on the 12/31
@@ -505,12 +572,13 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
             if hs > 0: hs *= (1 + r_hs)
             if ca > CASH_DISTRESS_FLOOR: ca *= (1 + r_ca)
             if legacy_pool > 0: legacy_pool *= (1 + r_lp)
+            if bk > 0: bk *= (1 + r_bk)  # basis is untouched by growth
             row["Return_PreTax"], row["Return_Roth"] = r_pt, r_ro
             row["Return_HSA"], row["Return_Cash"] = r_hs, r_ca
-            row["Return_Legacy_Pool"] = r_lp
+            row["Return_Legacy_Pool"], row["Return_Brokerage"] = r_lp, r_bk
         else:
             row["Return_PreTax"] = row["Return_Roth"] = row["Return_HSA"] = row["Return_Cash"] = 0.0
-            row["Return_Legacy_Pool"] = 0.0
+            row["Return_Legacy_Pool"] = row["Return_Brokerage"] = 0.0
 
         # Cash/MM interest is taxable annually as ordinary income (a money
         # market fund doesn't defer tax the way an equity account's
@@ -562,7 +630,12 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         # negative-return cut). Recorded for audit -- confirms every
         # scenario, including bad-return years, starts from the correctly
         # inflated baseline rather than some stale/un-inflated number.
-        base_exp_inflated_only = cfg["base_annual_expenses"] * (1 + infl) ** yir
+        if yir > 0:
+            if not (use_guardrail_inflation_rule and prev_year_negative_return):
+                base_exp_running *= (1 + infl)
+            # else: frozen -- no inflation increase this year (GK Inflation Rule)
+        base_exp_inflated_only = base_exp_running
+        row["Inflation_Frozen"] = bool(yir > 0 and use_guardrail_inflation_rule and prev_year_negative_return)
         base_exp = base_exp_inflated_only
         # Post-80 expense reduction (lifestyle slowdown)
         if age >= 80:
@@ -599,6 +672,9 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
                 is_negative_return = True
         elif cfg["pretax_return"] < 0:
             is_negative_return = True
+        # Recorded for the NEXT iteration's Inflation Rule check (this
+        # year's own base_exp was already set above using LAST year's value).
+        prev_year_negative_return = is_negative_return
 
         # Only fund the legacy gift out of this year's cash flow when it will
         # actually be deposited into Roth below (i.e. not a down-market year).
@@ -640,7 +716,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         row["RMD"] = rmd
 
         # ── BRACKET-OPTIMIZED DRAW STRATEGY ──
-        ptd = rod = hsd = cad = 0.0
+        ptd = rod = hsd = cad = bkd = 0.0
         need = max(0.0, total_exp - passive)
         std_ded_est = cfg["standard_deduction"] * std_ded_multiplier * (1 + binfl) ** yfb
         base_taxable = jss_tax + rent_tax + sp_inc
@@ -653,6 +729,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         if is_rmd_phase:
             if pt > 0: ptd = min(rmd, pt); need = max(0.0, need - ptd)
             if need > 0 and ca > 0: d = min(need, ca); cad += d; need -= d
+            if need > 0 and bk > 0: d = min(need, bk); bkd += d; need -= d
             if need > 0 and ro > 0: d = min(need, ro); rod += d; need -= d
             if need > 0 and hs > 0: d = min(need, hs); hsd += d; need -= d
             row["Draw_Strategy"] = "RMD-Dominated"
@@ -665,27 +742,44 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
                 # specific year is r_ca -- now uses the actual realized return.
                 mx = ca * r_ca if cfg["performance_draw_only"] else ca
                 d = min(need, max(0.0, mx)); cad += d; need -= d
+            if need > 0 and bk > 0: d = min(need, bk); bkd += d; need -= d
             if need > 0 and ro > 0: d = min(need, ro); rod += d; need -= d
             if need > 0 and hs > 0: d = min(need, hs); hsd += d; need -= d
             row["Draw_Strategy"] = "Bracket-Optimized"
 
         if need > 0:
-            for nm, avail in [("pretax", pt-ptd), ("cash", ca-cad),
+            for nm, avail in [("pretax", pt-ptd), ("cash", ca-cad), ("brokerage", bk-bkd),
                                ("roth", ro-rod), ("hsa", hs-hsd)]:
                 if need <= 0: continue
                 d = min(need, max(0.0, avail))
                 if nm == "pretax": ptd += d
                 elif nm == "cash": cad += d
+                elif nm == "brokerage": bkd += d
                 elif nm == "roth": rod += d
                 elif nm == "hsa": hsd += d
                 need -= d
 
+        # Brokerage draws realize a pro-rated long-term capital gain off the
+        # account's running cost basis -- a simplification (no lot-level
+        # detail, no annual qualified-dividend distributions), but it
+        # captures the real economics: contributed dollars come back
+        # tax-free, growth comes back as a taxed gain. basis_removed is
+        # applied to bk_basis in UPDATE BALANCES below.
+        if bkd > 0 and bk > 0:
+            basis_fraction = min(1.0, bk_basis / bk)
+            brokerage_ltcg_gain = bkd * (1 - basis_fraction)
+            basis_removed = bkd - brokerage_ltcg_gain
+        else:
+            brokerage_ltcg_gain = 0.0
+            basis_removed = 0.0
+        row["Brokerage_LTCG_Gain"] = brokerage_ltcg_gain
+
         row["PreTax_Draw"], row["Roth_Draw"] = ptd, rod
-        row["HSA_Draw"], row["Cash_Draw"] = hsd, cad
+        row["HSA_Draw"], row["Cash_Draw"], row["Brokerage_Draw"] = hsd, cad, bkd
         row["RMD_Excess"] = max(0.0, rmd - (total_exp - passive)) if is_rmd_phase else 0.0
 
         # ── TAX ──
-        other_taxable = ptd + jss_tax + rent_tax + sp_inc + cash_interest_taxable
+        other_taxable = ptd + jss_tax + rent_tax + sp_inc + cash_interest_taxable + brokerage_ltcg_gain
         sst = ss_taxable_portion(ss_inc, other_taxable, single=is_widowed)
         gross_taxable = other_taxable + sst
         std_ded = cfg["standard_deduction"] * std_ded_multiplier * (1 + binfl) ** yfb
@@ -698,7 +792,18 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         item_ded = med_ded + hdhp
         best_ded = max(std_ded, item_ded)
         fed_taxable = max(0.0, gross_taxable - best_ded)
-        fed_tax = calc_tax(fed_taxable, fed_brackets_yr, yfb, binfl)
+        # Federal taxes long-term capital gains at preferential rates,
+        # "stacked on top of" ordinary income (IRS Qualified Dividends and
+        # Capital Gain Tax Worksheet method): ordinary_taxable is fed_taxable
+        # with the LTCG gain backed out, taxed at ordinary rates; the gain
+        # itself is taxed via ltcg_brackets_yr starting from that floor, so
+        # it can be pushed into a higher LTCG bracket by other income (e.g.
+        # a large Roth conversion), same as in real life. When there's no
+        # brokerage gain this reduces to the old calc_tax(fed_taxable, ...).
+        ordinary_taxable = max(0.0, fed_taxable - brokerage_ltcg_gain)
+        fed_tax_ordinary = calc_tax(ordinary_taxable, fed_brackets_yr, yfb, binfl)
+        fed_ltcg_tax = calc_ltcg_tax(brokerage_ltcg_gain, ordinary_taxable, ltcg_brackets_yr, yfb, binfl)
+        fed_tax = fed_tax_ordinary + fed_ltcg_tax
         # Oregon fully exempts Social Security. The only SS-related dollars
         # ever present in gross_taxable are `sst` (other_taxable has no raw
         # ss_inc term), so subtracting `sst` alone fully backs SS out of the
@@ -721,8 +826,6 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         irmaa_cost = (IRMAA_MONTHLY_SURCHARGE * 12 * irmaa_people * (1 + infl) ** yfb) if irmaa_hit else 0.0
         row["MAGI"], row["IRMAA_Threshold"] = magi, irmaa_thr
         row["IRMAA_Hit"], row["IRMAA_Cost"] = irmaa_hit, irmaa_cost
-        fpl_700 = 7 * 20_440 * (1 + infl) ** yfb
-        row["FPL_700"], row["Under_700_FPL"] = fpl_700, magi < fpl_700
 
         # ── ROTH CONVERSION ──
         roth_conv_amt = roth_conv_tax = 0.0
@@ -733,7 +836,16 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
                 conv_room = min(conv_room, max(0.0, irmaa_thr - magi))
             roth_conv_amt = min(conv_room, max(0.0, pt - ptd - cfg["roth_conversion_margin"]))
             if roth_conv_amt > 0:
-                fc = calc_tax(fed_taxable + roth_conv_amt, fed_brackets_yr, yfb, binfl) - fed_tax
+                # Conversion income is ordinary and stacks BELOW the LTCG
+                # gain (a bigger conversion can push existing gains into a
+                # higher LTCG bracket) -- recompute the full ordinary+LTCG
+                # stack with the conversion added rather than taxing it at a
+                # flat marginal ordinary rate, to capture that knock-on
+                # effect. Reduces to the old formula when there's no gain.
+                ord_with_conv = ordinary_taxable + roth_conv_amt
+                fed_tax_with_conv = (calc_tax(ord_with_conv, fed_brackets_yr, yfb, binfl)
+                                      + calc_ltcg_tax(brokerage_ltcg_gain, ord_with_conv, ltcg_brackets_yr, yfb, binfl))
+                fc = fed_tax_with_conv - fed_tax
                 if cfg["oregon_resident"]:
                     # Was a flat 9% guess, inconsistent with the marginal-bracket
                     # approach used for federal (and not matching any actual
@@ -746,7 +858,8 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
 
         # ── UPDATE BALANCES ──
         pt -= (ptd + roth_conv_amt); ro -= rod; ro += roth_conv_amt; hs -= hsd; ca -= cad
-        total_income = passive + ptd + rod + hsd + cad
+        bk -= bkd; bk_basis -= basis_removed
+        total_income = passive + ptd + rod + hsd + cad + bkd
         surplus = total_income - total_exp - total_tax - roth_conv_tax - irmaa_cost
         ca += surplus
 
@@ -817,6 +930,8 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         pt = max(0.0, pt)
         ro = max(0.0, ro)
         hs = max(0.0, hs)
+        bk = max(0.0, bk)
+        bk_basis = max(0.0, min(bk_basis, bk))  # basis can never exceed balance
         legacy_pool = max(0.0, legacy_pool)
         # Cash IS allowed to go negative -- it represents a genuine funding
         # shortfall (expenses the plan couldn't cover from any account).
@@ -828,7 +943,8 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
 
         row["PreTax_EOY"], row["Roth_EOY"], row["HSA_EOY"] = pt, ro, hs
         row["Cash_EOY"] = ca
-        total_liquid = pt + ro + hs + ca
+        row["Brokerage_EOY"], row["Brokerage_Basis"] = bk, bk_basis
+        total_liquid = pt + ro + hs + ca + bk
         row["Total_Liquid_Assets"] = total_liquid  # parents' own spendable net worth (excludes gifted-away legacy_pool)
         row["Family_Net_Worth"] = total_liquid + legacy_pool  # includes money already gifted to the kids' Roths
         # "If death occurs at this age, what would each child actually
@@ -853,7 +969,10 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         hsa_after_tax_to_heirs = hs * (1 - heir_rate)  # HSAs lose tax-free status entirely for non-spouse heirs
         row["Heir_Tax_On_PreTax"] = pt * heir_rate
         row["Heir_Tax_On_HSA"] = hs * heir_rate
-        after_tax_estate = pretax_after_tax_to_heirs + hsa_after_tax_to_heirs + ro + ca
+        # Brokerage gets a full step-up in cost basis at death (IRC S1014):
+        # heirs owe no tax on gains accrued before death, so -- like Roth
+        # and cash -- it passes at full value, not haircut by heir_rate.
+        after_tax_estate = pretax_after_tax_to_heirs + hsa_after_tax_to_heirs + ro + ca + bk
         row["After_Tax_Estate_At_Death"] = after_tax_estate
         row["After_Tax_Family_Net_Worth"] = after_tax_estate + legacy_pool  # legacy pool is Roth -- already tax-free
         row["After_Tax_Estate_Per_Child"] = (after_tax_estate / n_kids) if n_kids else 0.0
@@ -861,7 +980,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
 
         row["Total_Real"] = (total_liquid / (1 + infl) ** yir) if yir > 0 else total_liquid
 
-        total_draws = ptd + rod + hsd + cad
+        total_draws = ptd + rod + hsd + cad + bkd
         row["Total_Draws"] = total_draws
         row["Withdrawal_Rate"] = total_draws / total_liquid if total_liquid > 0 else 0.0
         if use_guardrails:
@@ -996,6 +1115,7 @@ SENSITIVITY_VARS = [
     ("Roth Return", "roth_return", "additive", 0.015),
     ("HSA Return", "hsa_return", "additive", 0.015),
     ("Cash/MM Return", "cash_return", "additive", 0.01),
+    ("Brokerage Return", "brokerage_return", "additive", 0.015),
     ("General Inflation", "inflation_rate", "additive", 0.01),
     ("Healthcare Inflation", "healthcare_inflation", "additive", 0.02),
     ("Base Annual Expenses", "base_annual_expenses", "multiplicative", 0.15),
@@ -1099,6 +1219,8 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         ("S+ 5-Year", cfg["s_plus_5yr"]),
         ("S+ 10-Year", cfg["s_plus_10yr"]),
         ("Cash", cfg["cash"]),
+        ("Taxable Brokerage", cfg.get("brokerage", 0)),
+        ("Taxable Brokerage Cost Basis", cfg.get("brokerage_basis", cfg.get("brokerage", 0))),
         ("", ""),
         ("ANNUAL CONTRIBUTIONS (Working Years)", ""),
         ("401(k) Employee", cfg.get("contrib_401k", 24_500)),
@@ -1109,12 +1231,14 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         ("Employer Match", cfg.get("contrib_employer_match", 18_000)),
         ("Cash Savings", cfg.get("contrib_cash_annual", 150_000)),
         ("Final Year Cash Lump", cfg.get("contrib_cash_final_lump", 120_000)),
+        ("Taxable Brokerage Savings", cfg.get("contrib_brokerage_annual", 0)),
         ("", ""),
         ("PERFORMANCE", ""),
         ("PreTax Return", cfg["pretax_return"]),
         ("Roth Return", cfg["roth_return"]),
         ("HSA Return", cfg["hsa_return"]),
         ("Cash Return", cfg["cash_return"]),
+        ("Taxable Brokerage Return", cfg.get("brokerage_return", cfg["roth_return"])),
         ("", ""),
         ("INCOME SOURCES", ""),
         ("SS Start Age", cfg["ss_start_age"]),
@@ -1177,7 +1301,9 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
     if accum_df is not None and len(accum_df) > 0:
         ws_acc = wb.create_sheet("Accumulation")
         acc_cols = ["Age", "Year", "Contrib_PreTax", "Contrib_Roth", "Contrib_HSA", "Contrib_Cash",
-                    "PreTax_EOY", "Roth_EOY", "HSA_EOY", "Cash_EOY", "S_Plus_5yr", "S_Plus_10yr",
+                    "Contrib_Brokerage",
+                    "PreTax_EOY", "Roth_EOY", "HSA_EOY", "Cash_EOY", "Brokerage_EOY", "Brokerage_Basis",
+                    "S_Plus_5yr", "S_Plus_10yr",
                     "Total_Liquid_Assets"]
         for c, col in enumerate(acc_cols, 1):
             ws_acc.cell(row=1, column=c, value=col.replace("_", " "))
@@ -1198,12 +1324,13 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         "SS_Income", "JSS_Income", "JSS_Taxable", "Rental_Income", "Rental_Taxable",
         "S_Plus_Income", "Passive_Income",
         "Base_Expenses", "Healthcare_Cost", "HDHP", "Gifts", "Lump_Sum",
-        "Discretionary_Reduction", "Guardrail_Factor",
-        "PreTax_Draw", "Roth_Draw", "Cash_Draw", "HSA_Draw", "Total_Draws",
+        "Discretionary_Reduction", "Guardrail_Factor", "Inflation_Frozen",
+        "PreTax_Draw", "Roth_Draw", "Cash_Draw", "HSA_Draw", "Brokerage_Draw", "Total_Draws",
         "Total_Income", "Total_Expenses", "Total_Tax", "Surplus_Deficit",
-        "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool",
-        "PreTax_EOY", "Roth_EOY", "HSA_EOY", "Cash_EOY", "Total_Liquid_Assets", "Total_Real",
-        "Cash_Interest_Taxable",
+        "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool", "Return_Brokerage",
+        "PreTax_EOY", "Roth_EOY", "HSA_EOY", "Cash_EOY", "Brokerage_EOY", "Brokerage_Basis",
+        "Total_Liquid_Assets", "Total_Real",
+        "Cash_Interest_Taxable", "Brokerage_LTCG_Gain",
         "Gross_Taxable_Income", "Federal_Taxable_Income",
         "Standard_Deduction", "Itemized_Deduction", "Best_Deduction", "Deduction_Type",
         "Federal_Tax", "Oregon_Tax",
@@ -1225,8 +1352,9 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
     style_header(ws_ret, len(ret_cols))
 
     pct_columns = {"Effective_Tax_Rate", "Withdrawal_Rate", "Guardrail_Factor",
-                   "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool"}
-    bool_columns = {"IRMAA_Hit", "Bad_Return_Year"}
+                   "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool",
+                   "Return_Brokerage"}
+    bool_columns = {"IRMAA_Hit", "Bad_Return_Year", "Inflation_Frozen"}
     text_columns = {"Draw_Strategy", "Filing_Status", "Deduction_Type"}
     neg_fill = PatternFill("solid", fgColor="FFE0E0")
 
@@ -1261,6 +1389,7 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         ("  Roth IRA", first["Roth_EOY"]),
         ("  HSA", first["HSA_EOY"]),
         ("  Cash", first["Cash_EOY"]),
+        ("  Taxable Brokerage", first.get("Brokerage_EOY", 0.0)),
         ("", ""),
         (f"Your Own Estate at Age {cfg['planning_end_age']}", last["Total_Liquid_Assets"]),
         ("Real Value (inflation-adjusted)", last["Total_Real"]),
@@ -1461,6 +1590,31 @@ def main():
             s10_bal = st.number_input("S+ 10-Year Payout ($)", 0, 2_000_000, step=25_000, format="%d", key="s10_input")
             cash_bal = st.number_input("Cash ($)", 0, 1_000_000, step=10_000, format="%d", key="cash_input")
 
+        with st.expander("\U0001F4B9 Taxable Brokerage"):
+            st.caption(
+                "A separate, non-tax-advantaged investment account. Contributed "
+                "dollars come back tax-free on withdrawal; growth comes back as a "
+                "taxed long-term capital gain. Sits between Cash and Roth in the "
+                "draw order, and gets a full cost-basis step-up at death (unlike "
+                "PreTax/HSA) -- see the Tax and Legacy tabs."
+            )
+            brokerage_bal = st.number_input(
+                "Starting Balance ($)",
+                0, 5_000_000,
+                file_balances.get("brokerage") if file_balances.get("brokerage") is not None else 0,
+                step=25_000, format="%d", key="brokerage_input",
+            )
+            brokerage_basis_pct = st.slider(
+                "Starting Cost Basis (% of balance)", 0, 100, 100, 5,
+                help="100% = no embedded gain today (e.g. a brand-new account or "
+                     "one you're funding from cash). Lower this if the account "
+                     "already holds unrealized gains.",
+            )
+            brokerage_basis = brokerage_bal * brokerage_basis_pct / 100
+            c_brokerage = st.number_input("Annual Contribution (Working Years) ($)", 0, 200_000, 0, step=5_000, format="%d")
+            brokerage_ret = st.slider("Target Return %", 0.0, 12.0, 7.0, 0.5) / 100
+            brokerage_std_pct = st.slider("Return Std Dev % (Monte Carlo)", 1.0, 25.0, 15.0, 0.5) / 100
+
         with st.expander("\U0001F4BC Working Years Contributions"):
             st.caption(f"Annual contributions for {max(0, retirement_age - current_age)} remaining working years")
             c_401k = st.number_input("401(k) Employee ($)", 0, 50_000, 24_500, step=500, format="%d")
@@ -1533,9 +1687,12 @@ def main():
                 guardrail_floor_pct = gr_floor_pct / 100
                 guardrail_ceiling_pct = gr_ceiling_pct / 100
                 st.caption("Caps how far the cumulative guardrail adjustment can drift spending from your original plan, even after many consecutive stressed/flush years -- prevents unrealistic multi-year compounding down to a tiny fraction of your intended budget (or an unrealistically large raise on the upside).")
+                guardrail_inflation_rule = st.checkbox("Apply Inflation Rule (skip COLA after a down year)", value=True,
+                    help="The third classic Guyton-Klinger rule: freeze spending flat (no inflation increase) in any year immediately following a negative portfolio return, rather than raising it with that year's COLA regardless of how the portfolio just did.")
             else:
                 guardrail_band_pct, guardrail_adjustment_pct = 0.20, 0.10
                 guardrail_floor_pct, guardrail_ceiling_pct = 0.50, 1.50
+                guardrail_inflation_rule = True
             st.subheader("Lump Sum")
             lump_age = st.number_input("Lump at Age", 55, 95, 70)
             lump_amt = st.number_input("Lump Amount ($)", 0, 1_000_000, 0, step=10_000, format="%d")
@@ -1581,10 +1738,13 @@ def main():
         current_age=current_age, retirement_age=retirement_age, planning_end_age=planning_end,
         pretax_401k=pretax, roth_ira=roth_bal, hsa=hsa_bal,
         s_plus_5yr=s5_bal, s_plus_10yr=s10_bal, cash=cash_bal,
+        brokerage=brokerage_bal, brokerage_basis=brokerage_basis,
         contrib_401k=c_401k, contrib_roth401k=c_roth401k, contrib_roth_ira=c_roth_ira,
         contrib_hsa=c_hsa, contrib_mega_backdoor=c_mega, contrib_employer_match=c_match,
         contrib_cash_annual=c_cash, contrib_cash_final_lump=c_cash_lump,
+        contrib_brokerage_annual=c_brokerage,
         pretax_return=pretax_ret, roth_return=roth_ret, hsa_return=hsa_ret, cash_return=cash_ret,
+        brokerage_return=brokerage_ret, brokerage_std=brokerage_std_pct,
         ss_start_age=ss_age, ss_annual_amount=ss_amount, ss_cola=ss_cola,
         jss_start_age=jss_age, jss_annual_amount=jss_amount, jss_cola=jss_cola_pct,
         jss_recovery_years=jss_recovery, rental_gross=rental, rental_taxable_pct=rental_tax_pct,
@@ -1595,7 +1755,7 @@ def main():
         gifts_annual=gifts, lump_sums=lump_sums,
         standard_deduction=std_ded, bracket_inflation=bracket_infl, oregon_resident=or_resident,
         tax_cash_interest=tax_cash_int,
-        rmd_start_age=rmd_start, draw_order=["pretax", "cash", "roth", "hsa"],
+        rmd_start_age=rmd_start, draw_order=["pretax", "cash", "brokerage", "roth", "hsa"],
         roth_conversion_enabled=roth_conv, roth_conversion_target_bracket=roth_bracket,
         roth_conversion_margin=roth_margin, irmaa_avoidance=irmaa_avoid,
         performance_draw_only=perf_only,
@@ -1607,6 +1767,7 @@ def main():
         spending_strategy=spending_strategy,
         guardrail_band_pct=guardrail_band_pct, guardrail_adjustment_pct=guardrail_adjustment_pct,
         guardrail_floor_pct=guardrail_floor_pct, guardrail_ceiling_pct=guardrail_ceiling_pct,
+        guardrail_inflation_rule=guardrail_inflation_rule,
         model_widow_scenario=widow_scenario, first_death_age=first_death_age,
         ss_survivor_pct=ss_survivor_pct, jss_survivor_pct=jss_survivor_pct,
         expense_reduction_widowhood=exp_red_widow,
@@ -1651,10 +1812,10 @@ def main():
         df_disp["_deflate_yrs"] = accum_years + df_disp["Years_Retired"]
         money_cols = [c for c in df_disp.columns if c not in (
             "Age", "Year", "Years_Retired", "Phase", "Draw_Strategy",
-            "Effective_Tax_Rate", "Withdrawal_Rate", "PreTax_WR",
-            "IRMAA_Hit", "Under_700_FPL", "In_12_Bracket", "In_22_Bracket",
-            "Deduction_Type", "PreTax_Depleted", "Roth_Depleted", "HSA_Depleted",
+            "Effective_Tax_Rate", "Withdrawal_Rate",
+            "IRMAA_Hit", "Deduction_Type",
             "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash",
+            "Return_Legacy_Pool", "Return_Brokerage",
             "RMD_Excess", "_deflate_yrs")]
         for c in money_cols:
             if c in df_disp.columns and df_disp[c].dtype in [np.float64, np.int64, float, int]:
@@ -1712,6 +1873,7 @@ def main():
             fig = go.Figure()
             for col, name, color in [("Cash_EOY","Cash","rgba(46,134,193,0.6)"),
                                      ("HSA_EOY","HSA","rgba(39,174,96,0.6)"),
+                                     ("Brokerage_EOY","Brokerage","rgba(230,126,34,0.6)"),
                                      ("Roth_EOY","Roth","rgba(142,68,173,0.6)"),
                                      ("PreTax_EOY","PreTax","rgba(231,76,60,0.6)")]:
                 fig.add_trace(go.Scatter(x=accum_df["Age"], y=accum_df[col], mode="lines", name=name,
@@ -1728,6 +1890,7 @@ def main():
     with tabs[ti]:
         fig = go.Figure()
         for col, name, color in [("Cash_EOY","Cash","rgba(46,134,193,0.6)"), ("HSA_EOY","HSA","rgba(39,174,96,0.6)"),
+                                 ("Brokerage_EOY","Brokerage","rgba(230,126,34,0.6)"),
                                  ("Roth_EOY","Roth","rgba(142,68,173,0.6)"), ("PreTax_EOY","PreTax","rgba(231,76,60,0.6)")]:
             fig.add_trace(go.Scatter(x=df_disp["Age"], y=df_disp[col], mode="lines", name=name,
                                      stackgroup="one", line=dict(width=0.5), fillcolor=color))
@@ -2094,8 +2257,8 @@ def main():
         st.caption(f"Displaying in **{dollar_label}**")
         dcols = ["Age","Year","Draw_Strategy",
                  "SS_Income","JSS_Income","Rental_Income","S_Plus_Income","Passive_Income",
-                 "PreTax_Draw","Roth_Draw","Cash_Draw","HSA_Draw",
-                 "PreTax_EOY","Roth_EOY","HSA_EOY","Cash_EOY",
+                 "PreTax_Draw","Roth_Draw","Cash_Draw","Brokerage_Draw","HSA_Draw",
+                 "PreTax_EOY","Roth_EOY","HSA_EOY","Cash_EOY","Brokerage_EOY","Brokerage_LTCG_Gain",
                  "Total_Liquid_Assets","Family_Net_Worth","Total_Income","Total_Expenses","Total_Tax",
                  "Effective_Tax_Rate","Withdrawal_Rate","Surplus_Deficit",
                  "Roth_Conversion","RMD","RMD_Excess","IRMAA_Hit","Bad_Return_Year",
@@ -2106,10 +2269,10 @@ def main():
         avail = [c for c in dcols if c in df_disp.columns]
         show = st.multiselect("Columns", df_disp.columns.tolist(), default=avail)
         disp = df_disp[show].copy()
-        no_fmt = {"Age","Year","Years_Retired","Effective_Tax_Rate","Withdrawal_Rate","PreTax_WR",
-                  "IRMAA_Hit","Bad_Return_Year","Under_700_FPL","In_12_Bracket","In_22_Bracket","Draw_Strategy",
-                  "PreTax_Depleted","Roth_Depleted","HSA_Depleted","Return_PreTax","Return_Roth","Return_HSA","Return_Cash","Phase"}
-        pct = {"Effective_Tax_Rate","Withdrawal_Rate","PreTax_WR","Return_PreTax","Return_Roth","Return_HSA","Return_Cash"}
+        no_fmt = {"Age","Year","Years_Retired","Effective_Tax_Rate","Withdrawal_Rate",
+                  "IRMAA_Hit","Bad_Return_Year","Draw_Strategy",
+                  "Return_PreTax","Return_Roth","Return_HSA","Return_Cash","Phase"}
+        pct = {"Effective_Tax_Rate","Withdrawal_Rate","Return_PreTax","Return_Roth","Return_HSA","Return_Cash"}
         fmt = {}
         for c in show:
             if c in pct: fmt[c] = "{:.1%}"
