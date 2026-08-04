@@ -7,6 +7,29 @@ Usage:
   pip install streamlit plotly pandas numpy openpyxl
   streamlit run retirement_v9.py
 
+v13 enhancement (Variable Percentage Withdrawal -- new default strategy):
+  Added VPW as a third Spending Strategy option alongside Fixed Real
+  Spending and Dynamic Guardrails (Guyton-Klinger), and made it the
+  default. Each year, base spending is a percentage of the CURRENT total
+  portfolio balance, recalculated fresh via vpw_percentage() -- the
+  standard amortization formula (same math as an RMD divisor: draw a
+  balance earning an assumed real return to exactly zero over the
+  remaining years), with the percentage rising as the remaining horizon
+  shrinks. Popularized by the Bogleheads community specifically as an
+  alternative to fixed or step-adjusted withdrawal rules. Unlike
+  Guyton-Klinger's guardrail_factor, VPW has no persistent multiplier and
+  therefore no "stuck" state: a bad year changes next year's dollar
+  amount only because the portfolio shrank, and a full rebound restores
+  spending to parity immediately (verified directly: an offsetting
+  rebound the year after a -20% shock closes >98% of the gap by the
+  following year, vs. Guyton-Klinger's cuts which -- per the v11 finding
+  -- rarely reverse at all). The final simulated year is clamped to 100%
+  (the raw ordinary-annuity formula gives slightly over 100% at n=1,
+  which is meaningless as a share of a balance you actually have). Still
+  respects the Absolute Minimum Annual Expenses floor as a hard backstop,
+  same as the other two strategies. Purely additive: Fixed/Guardrails
+  behavior and the regression pin are unchanged.
+
 v12 default tuning (UI starting values, no engine/behavior changes):
   Annual Cash Savings 150k->40k, Final Year Cash Lump 120k->0, Brokerage
   Annual Contribution 0->200k, Fat-Tailed Returns off->on, Absolute
@@ -351,6 +374,31 @@ def get_rmd(bal, age, start):
         f = RMD_TABLE[min(RMD_TABLE)]  # shouldn't happen given the age < start guard above
     return bal / f if f > 0 else 0.0
 
+def vpw_percentage(age, planning_end_age, real_return):
+    """Variable Percentage Withdrawal: the fraction of the CURRENT portfolio
+    balance to spend this year, per the standard amortization formula (the
+    same math behind a mortgage payment or an RMD divisor) -- draw down a
+    balance earning `real_return` annually to exactly zero over the
+    remaining n years. Popularized by the Bogleheads community as an
+    alternative to fixed or step-adjusted (Guyton-Klinger-style) spending:
+    self-correcting every year by construction (this year's % applies to
+    whatever the portfolio actually is, good or bad), so a bad year never
+    leaves a permanent "stuck" reduction the way a guardrail step-cut can.
+    The percentage rises with age as the remaining horizon n shrinks --
+    that's intentional, not a bug: less time left means a larger share of
+    what's left gets drawn each year."""
+    n = max(1, planning_end_age - age + 1)  # years remaining, inclusive of this one
+    if abs(real_return) < 1e-9:
+        pct = 1.0 / n
+    else:
+        pct = real_return / (1 - (1 + real_return) ** (-n))
+    # The ordinary-annuity formula above gives slightly MORE than 100% in the
+    # final year (n=1) for any positive real_return -- mathematically
+    # correct under an end-of-year-payment convention, but nonsensical as a
+    # withdrawal rate against a CURRENT balance (you can't spend more than
+    # you have). Clamp to 100%: the last year simply spends what's left.
+    return min(pct, 1.0)
+
 def _standardized_shock(n, rng, fat_tailed, t_df):
     """Mean-0, unit-variance shock series. Normal by default; Student-t gives
     fatter tails (more frequent/severe extreme years) when fat_tailed=True."""
@@ -596,6 +644,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
     # guardrail, and the change compounds forward (a permanent step, not a
     # one-year blip), same as the real strategy.
     use_guardrails = cfg.get("spending_strategy") == "guardrails"
+    use_vpw = cfg.get("spending_strategy") == "vpw"
     guardrail_factor = 1.0
     initial_wr = None
     prev_wr = None
@@ -753,7 +802,20 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         # negative-return cut). Recorded for audit -- confirms every
         # scenario, including bad-return years, starts from the correctly
         # inflated baseline rather than some stale/un-inflated number.
-        base_exp_inflated_only = cfg["base_annual_expenses"] * (1 + infl) ** yir
+        if use_vpw:
+            # Bogleheads-style VPW: base spending is a percentage of the
+            # CURRENT total portfolio (post-growth, pre-draw balances
+            # already in scope here), recomputed fresh every year -- no
+            # inflation projection or persistent multiplier involved, since
+            # this year's nominal portfolio value already reflects
+            # everything (growth, inflation-driven asset prices) up to now.
+            total_liquid_pre_draw = pt + ro + hs + ca + bk
+            vpw_pct = vpw_percentage(age, cfg["planning_end_age"], cfg.get("vpw_real_return_pct", 0.04))
+            base_exp_inflated_only = total_liquid_pre_draw * vpw_pct
+            row["VPW_Percentage"] = vpw_pct
+        else:
+            base_exp_inflated_only = cfg["base_annual_expenses"] * (1 + infl) ** yir
+            row["VPW_Percentage"] = 0.0
         row["Inflation_Frozen"] = bool(yir > 0 and use_guardrail_inflation_rule and prev_year_negative_return)
         base_exp = base_exp_inflated_only
         # Post-80 expense reduction (lifestyle slowdown)
@@ -1415,6 +1477,7 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         ("Guardrail Floor (% of plan)", cfg.get("guardrail_floor_pct", "")),
         ("Guardrail Ceiling (% of plan)", cfg.get("guardrail_ceiling_pct", "")),
         ("Guardrail Inflation Rule Enabled", cfg.get("guardrail_inflation_rule", "")),
+        ("VPW Assumed Real Return", cfg.get("vpw_real_return_pct", "")),
         ("Absolute Minimum Annual Expenses (today's $)", cfg.get("absolute_min_annual_expenses", 0)),
         ("", ""),
         ("SURVIVING SPOUSE SCENARIO (v7)", ""),
@@ -1465,7 +1528,7 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         "SS_Income", "JSS_Income", "JSS_Taxable", "Rental_Income", "Rental_Taxable",
         "S_Plus_Income", "Passive_Income",
         "Base_Expenses", "Base_Expenses_Real", "Healthcare_Cost", "HDHP", "Gifts", "Lump_Sum",
-        "Discretionary_Reduction", "Guardrail_Factor", "Inflation_Frozen",
+        "Discretionary_Reduction", "Guardrail_Factor", "Inflation_Frozen", "VPW_Percentage",
         "Absolute_Min_Inflated", "Absolute_Min_Bound_Hit",
         "PreTax_Draw", "Roth_Draw", "Cash_Draw", "HSA_Draw", "Brokerage_Draw", "Total_Draws",
         "Total_Income", "Total_Expenses", "Total_Tax", "Surplus_Deficit",
@@ -1495,7 +1558,7 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
 
     pct_columns = {"Effective_Tax_Rate", "Withdrawal_Rate", "Guardrail_Factor",
                    "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool",
-                   "Return_Brokerage"}
+                   "Return_Brokerage", "VPW_Percentage"}
     bool_columns = {"IRMAA_Hit", "Bad_Return_Year", "Inflation_Frozen", "Absolute_Min_Bound_Hit"}
     text_columns = {"Draw_Strategy", "Filing_Status", "Deduction_Type"}
     neg_fill = PatternFill("solid", fgColor="FFE0E0")
@@ -1824,8 +1887,24 @@ def main():
                      "may not be livable. 0 = off (no absolute floor).",
             )
             st.subheader("Spending Strategy")
-            spending_strategy_choice = st.radio("Strategy", ["Fixed Real Spending", "Dynamic Guardrails (Guyton-Klinger)"], index=1)
-            spending_strategy = "guardrails" if spending_strategy_choice.startswith("Dynamic") else "fixed"
+            spending_strategy_choice = st.radio(
+                "Strategy",
+                ["Fixed Real Spending", "Dynamic Guardrails (Guyton-Klinger)", "Variable Percentage Withdrawal (VPW)"],
+                index=2,
+            )
+            if spending_strategy_choice.startswith("Dynamic"):
+                spending_strategy = "guardrails"
+            elif spending_strategy_choice.startswith("Variable"):
+                spending_strategy = "vpw"
+            else:
+                spending_strategy = "fixed"
+
+            # Defaults for whichever strategy-specific inputs aren't shown below
+            guardrail_band_pct, guardrail_adjustment_pct = 0.20, 0.10
+            guardrail_floor_pct, guardrail_ceiling_pct = 0.60, 1.50
+            guardrail_inflation_rule = True
+            vpw_real_return = 0.04
+
             if spending_strategy == "guardrails":
                 st.caption("Spending steps down permanently if your withdrawal rate drifts too high above your starting rate, and steps up if it drifts too low -- instead of a fixed inflation-adjusted amount every year.")
                 guardrail_band_pct = st.slider("Guardrail Band (± % of starting withdrawal rate)", 5, 40, 20, 5) / 100
@@ -1839,10 +1918,25 @@ def main():
                 st.caption("Caps how far the cumulative guardrail adjustment (both the withdrawal-rate rule AND the Inflation Rule below, combined) can drift spending from your original plan, even after many consecutive stressed/flush years -- prevents unrealistic multi-year compounding down to a tiny fraction of your intended budget (or an unrealistically large raise on the upside). A 60% floor leaves real room for the strategy to flex before the Absolute Minimum Annual Expenses floor (above) takes over as the true backstop -- tighten it if you'd rather the % bound do more of that work itself.")
                 guardrail_inflation_rule = st.checkbox("Apply Inflation Rule (skip COLA after a down year)", value=True,
                     help="The third classic Guyton-Klinger rule: cancel that year's COLA (instead of applying it) following a negative portfolio return. Folded into the same bounded Guardrail Factor as the withdrawal-rate rule above, so the Cumulative Spending Bound applies to their combined effect.")
-            else:
-                guardrail_band_pct, guardrail_adjustment_pct = 0.20, 0.10
-                guardrail_floor_pct, guardrail_ceiling_pct = 0.60, 1.50
-                guardrail_inflation_rule = True
+            elif spending_strategy == "vpw":
+                st.caption(
+                    "Spend a percentage of your CURRENT total portfolio balance each year, "
+                    "recalculated fresh annually -- the percentage itself rises with age (fewer "
+                    "expected remaining years), using the same amortization math as an RMD "
+                    "divisor. Self-correcting by construction: a bad year automatically reduces "
+                    "next year's dollar amount, a good year raises it, with no permanent 'stuck' "
+                    "step the way Guyton-Klinger's cuts can leave behind. Popularized by the "
+                    "Bogleheads community as a simpler alternative to fixed or guardrail-style "
+                    "withdrawals. The Absolute Minimum Annual Expenses floor above still applies "
+                    "on top as a hard backstop."
+                )
+                vpw_real_return = st.slider(
+                    "Assumed Real Return (%)", 0.0, 8.0, 4.0, 0.25,
+                    help="Expected long-run return net of inflation for your overall portfolio "
+                         "blend -- higher assumptions front-load more spending into earlier "
+                         "years. Typical published Bogleheads VPW tables use roughly 3-5% for a "
+                         "balanced (e.g. 60/40 stock/bond) portfolio.",
+                ) / 100
             st.subheader("Lump Sum")
             lump_age = st.number_input("Lump at Age", 55, 95, 70)
             lump_amt = st.number_input("Lump Amount ($)", 0, 1_000_000, 0, step=10_000, format="%d")
@@ -1919,6 +2013,7 @@ def main():
         guardrail_band_pct=guardrail_band_pct, guardrail_adjustment_pct=guardrail_adjustment_pct,
         guardrail_floor_pct=guardrail_floor_pct, guardrail_ceiling_pct=guardrail_ceiling_pct,
         guardrail_inflation_rule=guardrail_inflation_rule,
+        vpw_real_return_pct=vpw_real_return,
         model_widow_scenario=widow_scenario, first_death_age=first_death_age,
         ss_survivor_pct=ss_survivor_pct, jss_survivor_pct=jss_survivor_pct,
         expense_reduction_widowhood=exp_red_widow,
@@ -1966,7 +2061,7 @@ def main():
             "Effective_Tax_Rate", "Withdrawal_Rate",
             "IRMAA_Hit", "Deduction_Type",
             "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash",
-            "Return_Legacy_Pool", "Return_Brokerage",
+            "Return_Legacy_Pool", "Return_Brokerage", "VPW_Percentage",
             # Already computed as real (today's-$) figures by the engine --
             # deflating them again here would double-discount them.
             "Total_Real", "Base_Expenses_Real",
@@ -2447,7 +2542,7 @@ def main():
         st.caption(f"Displaying in **{dollar_label}**")
         dcols = ["Age","Year","Draw_Strategy",
                  "SS_Income","JSS_Income","Rental_Income","S_Plus_Income","Passive_Income",
-                 "Base_Expenses","Base_Expenses_Real","Guardrail_Factor","Inflation_Frozen",
+                 "Base_Expenses","Base_Expenses_Real","Guardrail_Factor","Inflation_Frozen","VPW_Percentage",
                  "PreTax_Draw","Roth_Draw","Cash_Draw","Brokerage_Draw","HSA_Draw",
                  "PreTax_EOY","Roth_EOY","HSA_EOY","Cash_EOY","Brokerage_EOY","Brokerage_LTCG_Gain",
                  "Total_Liquid_Assets","Family_Net_Worth","Total_Income","Total_Expenses","Total_Tax",
@@ -2463,7 +2558,7 @@ def main():
         no_fmt = {"Age","Year","Years_Retired","Effective_Tax_Rate","Withdrawal_Rate",
                   "IRMAA_Hit","Bad_Return_Year","Draw_Strategy","Inflation_Frozen","Absolute_Min_Bound_Hit",
                   "Return_PreTax","Return_Roth","Return_HSA","Return_Cash","Phase"}
-        pct = {"Effective_Tax_Rate","Withdrawal_Rate","Return_PreTax","Return_Roth","Return_HSA","Return_Cash","Guardrail_Factor"}
+        pct = {"Effective_Tax_Rate","Withdrawal_Rate","Return_PreTax","Return_Roth","Return_HSA","Return_Cash","Guardrail_Factor","VPW_Percentage"}
         fmt = {}
         for c in show:
             if c in pct: fmt[c] = "{:.1%}"
@@ -2498,7 +2593,7 @@ def main():
 
 **Surviving Spouse Scenario:** When enabled, filing status switches from MFJ to Single starting the year after the configured death age (the IRS allows MFJ in the year of death itself), pulling in single-filer federal brackets, a halved standard deduction, a halved IRMAA threshold, single Social Security taxability thresholds, and a configurable partial SS survivor benefit, pension survivor benefit, and living-expense reduction.
 
-**Spending Strategy:** Fixed Real Spending (default) inflates your base expenses every year. Dynamic Guardrails (Guyton-Klinger style) instead compares last year's withdrawal rate to a band around your starting rate and applies a permanent step up/down in spending when breached.
+**Spending Strategy:** Fixed Real Spending inflates your base expenses every year. Dynamic Guardrails (Guyton-Klinger style) compares last year's withdrawal rate to a band around your starting rate and applies a permanent step up/down in spending when breached, plus an Inflation Rule that cancels COLA after a down year. Variable Percentage Withdrawal (VPW, default) instead spends a percentage of your CURRENT total portfolio balance every year -- recalculated fresh annually using the same amortization math as an RMD divisor, with the percentage rising as you age -- so it self-corrects immediately with portfolio performance instead of carrying forward a permanent step the way Guyton-Klinger's cuts can. Popularized by the Bogleheads community. All three still respect the Absolute Minimum Annual Expenses floor as a hard backstop.
 
 **Cash Shortfalls:** Cash is allowed to go negative to represent a genuine funding gap; it is not floored to $0, so Total_Liquid_Assets and Monte Carlo success rates reflect real shortfalls rather than hiding them.
 

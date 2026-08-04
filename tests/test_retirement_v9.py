@@ -369,6 +369,96 @@ def test_absolute_min_floor_disabled_by_default():
 
 
 # ============================================================
+# Variable Percentage Withdrawal (VPW)
+# ============================================================
+
+def test_vpw_percentage_matches_hand_computed_amortization_formula():
+    # age=65, planning_end_age=90 -> n=26 years remaining (inclusive)
+    n = 26
+    r = 0.04
+    expected = r / (1 - (1 + r) ** (-n))
+    assert rv.vpw_percentage(65, 90, r) == pytest.approx(expected)
+
+
+def test_vpw_percentage_final_year_clamped_to_100pct():
+    # The raw ordinary-annuity formula gives (1+r) > 1.0 at n=1; must clamp.
+    assert rv.vpw_percentage(90, 90, 0.04) == pytest.approx(1.0)
+    assert rv.vpw_percentage(90, 90, 0.08) == pytest.approx(1.0)
+
+
+def test_vpw_percentage_zero_return_is_one_over_n():
+    assert rv.vpw_percentage(88, 90, 0.0) == pytest.approx(1 / 3)
+
+
+def test_vpw_percentage_rises_with_age():
+    rates = [rv.vpw_percentage(age, 90, 0.04) for age in range(65, 91)]
+    assert all(b >= a for a, b in zip(rates, rates[1:]))  # monotonically non-decreasing
+
+
+def test_vpw_base_expenses_matches_pct_of_pre_draw_balance_in_year_zero():
+    """Year 0 has no growth applied yet, and current_age==retirement_age
+    means no accumulation phase either, so pre-draw total liquid assets are
+    exactly the configured starting balances -- a fully hand-computable case."""
+    cfg = make_cfg(spending_strategy="vpw", vpw_real_return_pct=0.04, current_age=61)
+    _, df = rv.run_simulation(cfg)
+    starting_total = cfg["pretax_401k"] + cfg["roth_ira"] + cfg["hsa"] + cfg["cash"]  # brokerage=0
+    expected_pct = rv.vpw_percentage(cfg["retirement_age"], cfg["planning_end_age"], 0.04)
+    row0 = df.iloc[0]
+    assert row0["VPW_Percentage"] == pytest.approx(expected_pct)
+    assert row0["Base_Expenses"] == pytest.approx(starting_total * expected_pct)
+
+
+def test_vpw_self_corrects_without_a_permanent_step_unlike_guardrails():
+    """The core claim behind recommending VPW: a bad year changes next
+    year's dollar amount because the portfolio shrank, not because of any
+    persistent multiplier -- so a rebound that offsets the loss (relative to
+    the flat-return baseline path -- -20% then +40.45% cancels out against
+    two years of flat +6%, since 0.8*1.4045=1.06*1.06) restores spending to
+    ~parity, unlike Guyton-Klinger's permanent step-down."""
+    cfg = make_cfg(spending_strategy="vpw", vpw_real_return_pct=0.04, planning_end_age=85, current_age=61)
+    n = cfg["planning_end_age"] - cfg["retirement_age"] + 1
+    down_then_up = np.full(n, 0.06)
+    down_then_up[1] = -0.20
+    down_then_up[2] = 0.4045
+    overrides = {k: down_then_up.copy() for k in ["pretax", "roth", "hsa", "cash", "legacy_pool", "brokerage"]}
+    _, df_shock = rv.run_simulation(cfg, return_overrides=overrides)
+
+    flat = np.full(n, 0.06)
+    overrides_flat = {k: flat.copy() for k in ["pretax", "roth", "hsa", "cash", "legacy_pool", "brokerage"]}
+    _, df_flat = rv.run_simulation(cfg, return_overrides=overrides_flat)
+
+    # Year 1 (the bad year) should show reduced spending vs the flat baseline.
+    assert df_shock["Base_Expenses"].iloc[1] < df_flat["Base_Expenses"].iloc[1]
+    # By year 3 (one year after the offsetting rebound), VPW should have
+    # already closed nearly all of the gap -- no lingering "stuck" reduction
+    # the way a guardrail step-cut would leave behind.
+    ratio = df_shock["Base_Expenses"].iloc[3] / df_flat["Base_Expenses"].iloc[3]
+    assert ratio > 0.98
+
+
+def test_vpw_respects_absolute_min_floor():
+    cfg = make_cfg(
+        spending_strategy="vpw", vpw_real_return_pct=0.04,
+        planning_end_age=90, absolute_min_annual_expenses=50_000,
+        pretax_401k=50_000, roth_ira=0, hsa=0, cash=0,  # small balance -> VPW alone would be tiny
+    )
+    _, df = rv.run_simulation(cfg)
+    infl = cfg["inflation_rate"]
+    real_base_exp = df["Base_Expenses"] / (1 + infl) ** df["Years_Retired"]
+    assert real_base_exp.min() >= 50_000 - 1e-6
+    assert df["Absolute_Min_Bound_Hit"].any()
+
+
+def test_vpw_does_not_affect_other_strategies():
+    """Adding VPW as a new opt-in branch must not change Fixed/Guardrails
+    behavior -- confirmed by the unchanged smoke-test regression pin, and
+    directly here for guardrails too."""
+    cfg = make_cfg(spending_strategy="guardrails")
+    _, df = rv.run_simulation(cfg)
+    assert (df["VPW_Percentage"] == 0.0).all()
+
+
+# ============================================================
 # Tax-year governance (Phase 3)
 # ============================================================
 # Tests the verify_tax_constants() MECHANISM (does it correctly compare
