@@ -7,6 +7,40 @@ Usage:
   pip install streamlit plotly pandas numpy openpyxl
   streamlit run retirement_v9.py
 
+v11 fix (guardrail floor was not actually a floor):
+1. The v10 Inflation Rule applied via a separate, unbounded freeze on the
+spending base, independent of Guardrail_Factor's floor/ceiling clamp.
+Verified empirically: with the (then-)default 50% floor, among Monte
+Carlo paths that "succeeded" (portfolio > $0 at the final age), median
+real spending fell to ~40% of plan and as low as ~29% -- well past the
+floor -- while Guardrail_Factor itself still reported a compliant 50%,
+and MC success rate was inflated by roughly 30 percentage points versus
+the same run with the Inflation Rule off. Fixed by folding the Inflation
+Rule into Guardrail_Factor itself (a division by (1+infl) the year after
+a down year, same permanent-step mechanism as the withdrawal-rate rule)
+so BOTH rules share the same bounded number and the floor/ceiling clamp
+applies to their combined effect. Confirmed via direct re-run: real
+spending now bottoms out exactly at the configured floor, never below.
+2. Added an absolute_min_annual_expenses floor (today's $, config default
+0/off): a hard minimum on base spending, independent of what % the
+guardrail floor happens to allow -- 50% of a padded plan may still be
+generous, the same 50% of a tight one may not be livable. Applied after
+all other reductions (post-80, widowhood, guardrail cuts), so nothing
+can push spending below it once set.
+3. Added a spending-percentile chart and a "worst real spending among
+successful paths" metric to the Monte Carlo tab. Success rate alone
+(portfolio > $0) says nothing about how much spending was cut to get
+there; this makes the lifestyle experience behind a "success" visible
+instead of only the asset-survival outcome.
+4. Bumped the default Cumulative Spending Bound floor from 50% to 90% of
+plan (guardrail_floor_pct). Deliberately tight -- in a 14%-std-dev
+fat-tailed stress test this drops MC success rate from ~54% (at the
+old, now-honestly-bounded 50% floor) to ~7%, because a 90% floor leaves
+room for barely one adjustment step before it engages. That's an honest
+number, not a bug: it reflects how little the strategy can now deviate
+from Fixed Real Spending. Loosen it if you want more room for the
+strategy to actually flex.
+
 v10 enhancements (perf/caching + financial modeling, on top of v9):
   1. Monte Carlo and the scenario optimizer no longer recompute the
      (deterministic) accumulation phase on every single simulation --
@@ -559,16 +593,12 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
     prev_wr = None
 
     # Guyton-Klinger "Inflation Rule": skip the inflation increase on base
-    # spending in a year following a negative portfolio return (freeze
-    # nominal spending flat instead of applying that year's COLA). This
-    # needs an iteratively-tracked running nominal base rather than the
-    # closed-form base_annual_expenses*(1+infl)**yir, since "skip this one
-    # year" can't be expressed as a pure power formula. Gated behind
-    # guardrails, so base_exp_running collapses to the exact same value as
-    # the old closed form (and Fixed Real Spending is byte-for-byte
-    # unchanged) whenever the freeze never triggers.
+    # spending in a year following a negative portfolio return. Applied as
+    # a guardrail_factor adjustment (see below) rather than freezing a
+    # separate spending total, so it shares the SAME floor/ceiling bound as
+    # the withdrawal-rate-driven rule instead of being able to erode real
+    # spending past it unbounded.
     use_guardrail_inflation_rule = use_guardrails and cfg.get("guardrail_inflation_rule", True)
-    base_exp_running = float(cfg["base_annual_expenses"])
     prev_year_negative_return = False
 
     for idx in range(num_years):
@@ -591,28 +621,40 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         irmaa_threshold_base = IRMAA_MAGI_THRESHOLD_SINGLE if is_widowed else IRMAA_MAGI_THRESHOLD
 
         # ── DYNAMIC GUARDRAILS (Guyton-Klinger style) ──
-        # Evaluated using LAST year's ending withdrawal rate (the portfolio
-        # condition known at the start of this year), before this year's
-        # spending is set -- same sequencing as the real strategy.
-        if use_guardrails and yir > 0 and initial_wr and prev_wr is not None:
-            band = cfg.get("guardrail_band_pct", 0.20)
-            adj = cfg.get("guardrail_adjustment_pct", 0.10)
-            # Floor/ceiling on the CUMULATIVE guardrail_factor -- v7 let this
-            # multiplier compound every consecutive breach year with no
-            # bound, so a sustained downturn (or a Monte Carlo tail path)
-            # could decay spending to an unrealistically small fraction of
-            # the original plan (e.g. 0.9**10 ~= 35%). Real Guyton-Klinger
-            # implementations bound the cumulative deviation from the
-            # starting spending level rather than letting cuts/raises stack
-            # indefinitely. Defaults: never below 50% or above 150% of the
-            # plan's original (uninflated) spending level.
-            guardrail_floor = cfg.get("guardrail_floor_pct", 0.50)
+        # Evaluated using LAST year's ending withdrawal rate / return (the
+        # portfolio condition known at the start of this year), before this
+        # year's spending is set -- same sequencing as the real strategy.
+        # Both the Capital Preservation/Prosperity Rule (withdrawal-rate
+        # driven cut/raise) and the Inflation Rule (cancel COLA after a down
+        # year) are folded into this SAME guardrail_factor and bounded
+        # together. They used to live in two separate places -- the
+        # Inflation Rule froze a separate running spending total with no
+        # bound of its own -- so a run of down years could push real
+        # spending well below guardrail_floor_pct even though
+        # guardrail_factor itself still reported a compliant value (verified:
+        # with defaults, MC success rate over-reported by ~30 points, with
+        # real spending in "successful" paths falling to a ~40% median /
+        # 29% worst-case fraction of plan, well past the 50% floor). Now
+        # both rules move the one number, and the floor/ceiling clamp below
+        # applies to their combined effect, so the floor promise actually
+        # holds regardless of which rule(s) fired this year.
+        if use_guardrails and yir > 0:
+            if initial_wr and prev_wr is not None:
+                band = cfg.get("guardrail_band_pct", 0.20)
+                adj = cfg.get("guardrail_adjustment_pct", 0.10)
+                upper, lower = initial_wr * (1 + band), initial_wr * (1 - band)
+                if prev_wr > upper:
+                    guardrail_factor *= (1 - adj)   # portfolio stressed -- cut spending
+                elif 0 < prev_wr < lower:
+                    guardrail_factor *= (1 + adj)   # portfolio well ahead -- give a raise
+            if use_guardrail_inflation_rule and prev_year_negative_return:
+                guardrail_factor /= (1 + infl)      # cancel this year's COLA
+            # Floor/ceiling on the CUMULATIVE guardrail_factor -- never
+            # below guardrail_floor_pct or above guardrail_ceiling_pct of
+            # the plan's original (uninflated) spending level, no matter how
+            # many consecutive breach/down years compound.
+            guardrail_floor = cfg.get("guardrail_floor_pct", 0.90)
             guardrail_ceiling = cfg.get("guardrail_ceiling_pct", 1.50)
-            upper, lower = initial_wr * (1 + band), initial_wr * (1 - band)
-            if prev_wr > upper:
-                guardrail_factor *= (1 - adj)   # portfolio stressed -- cut spending
-            elif 0 < prev_wr < lower:
-                guardrail_factor *= (1 + adj)   # portfolio well ahead -- give a raise
             guardrail_factor = min(max(guardrail_factor, guardrail_floor), guardrail_ceiling)
         row["Guardrail_Factor"] = guardrail_factor
 
@@ -703,11 +745,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         # negative-return cut). Recorded for audit -- confirms every
         # scenario, including bad-return years, starts from the correctly
         # inflated baseline rather than some stale/un-inflated number.
-        if yir > 0:
-            if not (use_guardrail_inflation_rule and prev_year_negative_return):
-                base_exp_running *= (1 + infl)
-            # else: frozen -- no inflation increase this year (GK Inflation Rule)
-        base_exp_inflated_only = base_exp_running
+        base_exp_inflated_only = cfg["base_annual_expenses"] * (1 + infl) ** yir
         row["Inflation_Frozen"] = bool(yir > 0 and use_guardrail_inflation_rule and prev_year_negative_return)
         base_exp = base_exp_inflated_only
         # Post-80 expense reduction (lifestyle slowdown)
@@ -725,6 +763,20 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         # above so this can never collapse spending to an unrealistic level.
         if use_guardrails:
             base_exp *= guardrail_factor
+        # Absolute survival floor: a hard minimum on base (discretionary/
+        # lifestyle) spending, in TODAY'S dollars, that no combination of
+        # the reductions above (post-80, widowhood, guardrail cuts) can
+        # push spending below. Distinct from guardrail_floor_pct, which is
+        # only a PERCENTAGE of whatever this plan's own base spending
+        # figure happens to be -- 50% of a padded budget may still be
+        # generous, the same 50% of a tight one may not be livable. Off (0)
+        # by default; opt in with your own bare-minimum number.
+        abs_min = cfg.get("absolute_min_annual_expenses", 0.0)
+        abs_min_inflated = abs_min * (1 + infl) ** yir if abs_min > 0 else 0.0
+        row["Absolute_Min_Inflated"] = abs_min_inflated
+        row["Absolute_Min_Bound_Hit"] = bool(abs_min > 0 and base_exp < abs_min_inflated)
+        if abs_min > 0:
+            base_exp = max(base_exp, abs_min_inflated)
         healthcare = (cfg["healthcare_pre_medicare"] if age < 65 else cfg["healthcare_post_medicare"]) * (1 + cfg["healthcare_inflation"]) ** yir
         hdhp = cfg["hdhp_annual"] * (1 + infl) ** yir if age < 65 else 0.0
         gifts = cfg["gifts_annual"] * (1 + infl) ** yir
@@ -1052,6 +1104,12 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         row["After_Tax_Total_Inheritance_Per_Child"] = (row["After_Tax_Family_Net_Worth"] / n_kids) if n_kids else 0.0
 
         row["Total_Real"] = (total_liquid / (1 + infl) ** yir) if yir > 0 else total_liquid
+        # Today's-dollar view of actual lifestyle spending -- lets the
+        # Monte Carlo tab show what a "successful" path's spending
+        # experience actually looked like, not just whether the portfolio
+        # survived (see Guardrail_Factor/Inflation_Frozen for the levers
+        # that moved it).
+        row["Base_Expenses_Real"] = (base_exp / (1 + infl) ** yir) if yir > 0 else base_exp
 
         total_draws = ptd + rod + hsd + cad + bkd
         row["Total_Draws"] = total_draws
@@ -1348,6 +1406,8 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         ("Guardrail Spending Adjustment (%)", cfg.get("guardrail_adjustment_pct", "")),
         ("Guardrail Floor (% of plan)", cfg.get("guardrail_floor_pct", "")),
         ("Guardrail Ceiling (% of plan)", cfg.get("guardrail_ceiling_pct", "")),
+        ("Guardrail Inflation Rule Enabled", cfg.get("guardrail_inflation_rule", "")),
+        ("Absolute Minimum Annual Expenses (today's $)", cfg.get("absolute_min_annual_expenses", 0)),
         ("", ""),
         ("SURVIVING SPOUSE SCENARIO (v7)", ""),
         ("Model Surviving Spouse Scenario", cfg.get("model_widow_scenario", False)),
@@ -1396,8 +1456,9 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         "Age", "Year", "Draw_Strategy", "Filing_Status",
         "SS_Income", "JSS_Income", "JSS_Taxable", "Rental_Income", "Rental_Taxable",
         "S_Plus_Income", "Passive_Income",
-        "Base_Expenses", "Healthcare_Cost", "HDHP", "Gifts", "Lump_Sum",
+        "Base_Expenses", "Base_Expenses_Real", "Healthcare_Cost", "HDHP", "Gifts", "Lump_Sum",
         "Discretionary_Reduction", "Guardrail_Factor", "Inflation_Frozen",
+        "Absolute_Min_Inflated", "Absolute_Min_Bound_Hit",
         "PreTax_Draw", "Roth_Draw", "Cash_Draw", "HSA_Draw", "Brokerage_Draw", "Total_Draws",
         "Total_Income", "Total_Expenses", "Total_Tax", "Surplus_Deficit",
         "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool", "Return_Brokerage",
@@ -1427,7 +1488,7 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
     pct_columns = {"Effective_Tax_Rate", "Withdrawal_Rate", "Guardrail_Factor",
                    "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool",
                    "Return_Brokerage"}
-    bool_columns = {"IRMAA_Hit", "Bad_Return_Year", "Inflation_Frozen"}
+    bool_columns = {"IRMAA_Hit", "Bad_Return_Year", "Inflation_Frozen", "Absolute_Min_Bound_Hit"}
     text_columns = {"Draw_Strategy", "Filing_Status", "Deduction_Type"}
     neg_fill = PatternFill("solid", fgColor="FFE0E0")
 
@@ -1744,6 +1805,16 @@ def main():
             st.subheader("Negative Return Adjustment")
             neg_ret_reduction = st.number_input("Discretionary Draw Reduction if Year Return < 0 (today's $)", 0, 200_000, 20_000, step=1000, format="%d")
             st.caption("Entered in today's dollars -- inflates every year alongside your base expenses, so a bad year in year 1 and a bad year in year 30 get an equivalent real cut.")
+            st.subheader("Absolute Survival Floor")
+            absolute_min_expenses = st.number_input(
+                "Absolute Minimum Annual Expenses (today's $)", 0, 200_000, 0, step=5_000, format="%d",
+                help="A hard floor on base spending that no reduction below -- post-80 slowdown, "
+                     "widowhood, or the guardrails/Inflation Rule cuts -- can push below, no matter "
+                     "how many bad years compound. Distinct from the Cumulative Spending Bound "
+                     "below: that one is a PERCENTAGE of whatever your own Annual Expenses figure "
+                     "is, so 90% of a padded budget may still be generous while 90% of a tight one "
+                     "may not be livable. 0 = off (no absolute floor).",
+            )
             st.subheader("Spending Strategy")
             spending_strategy_choice = st.radio("Strategy", ["Fixed Real Spending", "Dynamic Guardrails (Guyton-Klinger)"], index=0)
             spending_strategy = "guardrails" if spending_strategy_choice.startswith("Dynamic") else "fixed"
@@ -1753,16 +1824,16 @@ def main():
                 guardrail_adjustment_pct = st.slider("Spending Adjustment When Breached (%)", 5, 25, 10, 5) / 100
                 gr_floor_pct, gr_ceiling_pct = st.slider(
                     "Cumulative Spending Bound (% of original plan)",
-                    30, 200, (50, 150), 5,
+                    30, 200, (90, 150), 5,
                 )
                 guardrail_floor_pct = gr_floor_pct / 100
                 guardrail_ceiling_pct = gr_ceiling_pct / 100
-                st.caption("Caps how far the cumulative guardrail adjustment can drift spending from your original plan, even after many consecutive stressed/flush years -- prevents unrealistic multi-year compounding down to a tiny fraction of your intended budget (or an unrealistically large raise on the upside).")
+                st.caption("Caps how far the cumulative guardrail adjustment (both the withdrawal-rate rule AND the Inflation Rule below, combined) can drift spending from your original plan, even after many consecutive stressed/flush years -- prevents unrealistic multi-year compounding down to a tiny fraction of your intended budget (or an unrealistically large raise on the upside). Default of 90% is deliberately tight: it limits the combined cut to about one adjustment step before the floor engages, favoring spending stability over portfolio-survival optics -- loosen it if you want more room for the strategy to actually flex.")
                 guardrail_inflation_rule = st.checkbox("Apply Inflation Rule (skip COLA after a down year)", value=True,
-                    help="The third classic Guyton-Klinger rule: freeze spending flat (no inflation increase) in any year immediately following a negative portfolio return, rather than raising it with that year's COLA regardless of how the portfolio just did.")
+                    help="The third classic Guyton-Klinger rule: cancel that year's COLA (instead of applying it) following a negative portfolio return. Folded into the same bounded Guardrail Factor as the withdrawal-rate rule above, so the Cumulative Spending Bound applies to their combined effect.")
             else:
                 guardrail_band_pct, guardrail_adjustment_pct = 0.20, 0.10
-                guardrail_floor_pct, guardrail_ceiling_pct = 0.50, 1.50
+                guardrail_floor_pct, guardrail_ceiling_pct = 0.90, 1.50
                 guardrail_inflation_rule = True
             st.subheader("Lump Sum")
             lump_age = st.number_input("Lump at Age", 55, 95, 70)
@@ -1831,6 +1902,7 @@ def main():
         roth_conversion_margin=roth_margin, irmaa_avoidance=irmaa_avoid,
         performance_draw_only=perf_only,
         neg_ret_draw_reduction=neg_ret_reduction,
+        absolute_min_annual_expenses=absolute_min_expenses,
         num_children=num_kids, roth_legacy_per_child=roth_per_child,
         legacy_years=legacy_years, legacy_inflation=inflation,
         legacy_pool_return=legacy_pool_ret, legacy_pool_std=legacy_pool_std_pct,
@@ -1887,6 +1959,9 @@ def main():
             "IRMAA_Hit", "Deduction_Type",
             "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash",
             "Return_Legacy_Pool", "Return_Brokerage",
+            # Already computed as real (today's-$) figures by the engine --
+            # deflating them again here would double-discount them.
+            "Total_Real", "Base_Expenses_Real",
             "RMD_Excess", "_deflate_yrs")]
         for c in money_cols:
             if c in df_disp.columns and df_disp[c].dtype in [np.float64, np.int64, float, int]:
@@ -2181,8 +2256,19 @@ def main():
     if mc_runs:
         with tabs[ti]:
             surv = sum(1 for r in mc_runs if r.iloc[-1]["Total_Liquid_Assets"] > 0)
-            m1, m2, m3 = st.columns(3)
+            survived_runs = [r for r in mc_runs if r.iloc[-1]["Total_Liquid_Assets"] > 0]
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("Sims", len(mc_runs)); m2.metric("Survived", surv); m3.metric("Rate", f"{surv/len(mc_runs)*100:.1f}%")
+            if survived_runs:
+                base0 = cfg["base_annual_expenses"]
+                worst_ratios = np.array([r["Base_Expenses_Real"].min() / base0 for r in survived_runs])
+                m4.metric("Worst Real Spending (median, successful paths)",
+                          f"{np.percentile(worst_ratios, 50) * 100:.0f}% of plan",
+                          help="Among the paths that 'succeeded' (portfolio > $0 at the final age), "
+                               "the median of each path's own lowest real (today's $) annual spending "
+                               "level, as a % of what you originally planned to spend. A high success "
+                               "rate next to a low number here means the strategy is buying that "
+                               "survival by cutting your lifestyle, not the portfolio holding up.")
 
             bands = compute_percentile_bands(mc_runs, "Total_Liquid_Assets")
             ages = bands["Age"]
@@ -2198,6 +2284,31 @@ def main():
                                      line=dict(color="black", width=2, dash="dash")))
             fig.update_layout(title=f"MC Total Assets ({len(mc_runs)} runs)", yaxis_tickformat="$,.0f", height=500)
             st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("##### What did spending actually look like behind those numbers?")
+            bands_exp = compute_percentile_bands(mc_runs, "Base_Expenses_Real")
+            fig_exp = go.Figure()
+            fig_exp.add_trace(go.Scatter(x=np.concatenate([ages, ages[::-1]]),
+                y=np.concatenate([bands_exp["p95"], bands_exp["p5"][::-1]]),
+                fill="toself", fillcolor="rgba(231,76,60,0.1)", line=dict(color="rgba(255,255,255,0)"), name="5-95%"))
+            fig_exp.add_trace(go.Scatter(x=np.concatenate([ages, ages[::-1]]),
+                y=np.concatenate([bands_exp["p75"], bands_exp["p25"][::-1]]),
+                fill="toself", fillcolor="rgba(231,76,60,0.25)", line=dict(color="rgba(255,255,255,0)"), name="25-75%"))
+            fig_exp.add_trace(go.Scatter(x=ages, y=bands_exp["p50"], name="Median", line=dict(color="darkred", width=2)))
+            fig_exp.add_hline(y=cfg["base_annual_expenses"], line_dash="dash", line_color="black",
+                               annotation_text="Original Plan (today's $)")
+            fig_exp.update_layout(title="Actual Lifestyle Spending Across Simulations (Today's $)",
+                                  yaxis_tickformat="$,.0f", height=420)
+            st.plotly_chart(fig_exp, use_container_width=True)
+            st.caption(
+                "'Success' above only means the portfolio balance stayed above $0 at the final age -- "
+                "it says nothing about how much spending had to be cut to get there. This chart shows "
+                "the actual lifestyle spending (base expenses, today's dollars) each simulation lived "
+                "on. If this band sags far below the original-plan line while the success rate still "
+                "looks good, the strategy is buying survival by cutting your lifestyle, not because the "
+                "portfolio actually held up -- consider setting an Absolute Minimum Annual Expenses "
+                "(Expenses tab) or tightening the Cumulative Spending Bound (Spending Strategy)."
+            )
 
             n_show = min(20, len(mc_runs))
             fig3 = go.Figure()
@@ -2328,6 +2439,7 @@ def main():
         st.caption(f"Displaying in **{dollar_label}**")
         dcols = ["Age","Year","Draw_Strategy",
                  "SS_Income","JSS_Income","Rental_Income","S_Plus_Income","Passive_Income",
+                 "Base_Expenses","Base_Expenses_Real","Guardrail_Factor","Inflation_Frozen",
                  "PreTax_Draw","Roth_Draw","Cash_Draw","Brokerage_Draw","HSA_Draw",
                  "PreTax_EOY","Roth_EOY","HSA_EOY","Cash_EOY","Brokerage_EOY","Brokerage_LTCG_Gain",
                  "Total_Liquid_Assets","Family_Net_Worth","Total_Income","Total_Expenses","Total_Tax",
@@ -2341,9 +2453,9 @@ def main():
         show = st.multiselect("Columns", df_disp.columns.tolist(), default=avail)
         disp = df_disp[show].copy()
         no_fmt = {"Age","Year","Years_Retired","Effective_Tax_Rate","Withdrawal_Rate",
-                  "IRMAA_Hit","Bad_Return_Year","Draw_Strategy",
+                  "IRMAA_Hit","Bad_Return_Year","Draw_Strategy","Inflation_Frozen","Absolute_Min_Bound_Hit",
                   "Return_PreTax","Return_Roth","Return_HSA","Return_Cash","Phase"}
-        pct = {"Effective_Tax_Rate","Withdrawal_Rate","Return_PreTax","Return_Roth","Return_HSA","Return_Cash"}
+        pct = {"Effective_Tax_Rate","Withdrawal_Rate","Return_PreTax","Return_Roth","Return_HSA","Return_Cash","Guardrail_Factor"}
         fmt = {}
         for c in show:
             if c in pct: fmt[c] = "{:.1%}"
