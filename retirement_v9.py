@@ -7,6 +7,32 @@ Usage:
   pip install streamlit plotly pandas numpy openpyxl
   streamlit run retirement_v9.py
 
+v14 fix (VPW was force-spending money nobody would actually consume):
+1. Traced why late-plan spending under VPW spikes while the estate
+collapses: VPW's withdrawal % is designed to amortize the portfolio to
+(near) zero by planning_end_age, so the % necessarily accelerates
+(clamped to 100% in the final year) as the horizon shrinks. But the
+model had no concept of "withdrew more than was actually spent" -- the
+full VPW-calculated amount always flowed into Base_Expenses/total_exp
+and was drawn from the accounts as though 100% of it were consumed,
+even in a large portfolio's final years where that could exceed a
+realistic budget entirely (verified: a large enough portfolio could
+even go temporarily insolvent once healthcare/HDHP/etc. stacked on top
+of a 100%-of-portfolio VPW draw).
+2. Added max_annual_expenses (today's $, UI default = your Annual
+Expenses figure): a hard ceiling on base spending, applied BEFORE
+total_exp/the draw waterfall are built, so anything above it simply
+stays invested instead of being withdrawn at all -- not
+drawn-then-unaccounted-for. Mirrors the existing
+absolute_min_annual_expenses floor structurally. Also caps Guardrails'
+Prosperity Rule upside; a no-op for Fixed Real Spending, which never
+exceeds its own planned amount. Off (0) by default at the engine level
+for direct API/test use.
+3. Bumped the default Plan Through Age (planning_end_age) from 89 to 95
+-- at 89 it was fighting against VPW's now-default selection, forcing
+an aggressive drawdown-to-zero on a much shorter horizon than most
+plans should assume. Still user-adjustable.
+
 v13 enhancement (Variable Percentage Withdrawal -- new default strategy):
   Added VPW as a third Spending Strategy option alongside Fixed Real
   Spending and Dynamic Guardrails (Guyton-Klinger), and made it the
@@ -847,6 +873,27 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         row["Absolute_Min_Bound_Hit"] = bool(abs_min > 0 and base_exp < abs_min_inflated)
         if abs_min > 0:
             base_exp = max(base_exp, abs_min_inflated)
+        # Spending ceiling: a hard maximum on base spending, in TODAY'S
+        # dollars. Matters most for VPW, whose withdrawal percentage
+        # accelerates toward the plan's end (see vpw_percentage) and would
+        # otherwise force this year's ENTIRE calculated draw to be treated
+        # as spent -- the model has no separate concept of "withdrew more
+        # than I actually spent," so an unbounded VPW percentage in the
+        # final years both draws down the portfolio and inflates
+        # Base_Expenses to match, whether or not that much would really be
+        # consumed. Applied here, BEFORE total_exp/the draw waterfall are
+        # built below, so anything above the ceiling simply stays invested
+        # instead of being drawn at all -- not drawn-then-unaccounted-for.
+        # Also caps Guardrails' Prosperity Rule upside; a no-op for Fixed
+        # Real Spending, which never exceeds its own planned amount. Off
+        # (0) by default at the engine level; the UI defaults it to your
+        # Annual Expenses figure.
+        max_exp = cfg.get("max_annual_expenses", 0.0)
+        max_exp_inflated = max_exp * (1 + infl) ** yir if max_exp > 0 else 0.0
+        row["Max_Annual_Expenses_Inflated"] = max_exp_inflated
+        row["Max_Expenses_Bound_Hit"] = bool(max_exp > 0 and base_exp > max_exp_inflated)
+        if max_exp > 0:
+            base_exp = min(base_exp, max_exp_inflated)
         healthcare = (cfg["healthcare_pre_medicare"] if age < 65 else cfg["healthcare_post_medicare"]) * (1 + cfg["healthcare_inflation"]) ** yir
         hdhp = cfg["hdhp_annual"] * (1 + infl) ** yir if age < 65 else 0.0
         gifts = cfg["gifts_annual"] * (1 + infl) ** yir
@@ -1479,6 +1526,7 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         ("Guardrail Inflation Rule Enabled", cfg.get("guardrail_inflation_rule", "")),
         ("VPW Assumed Real Return", cfg.get("vpw_real_return_pct", "")),
         ("Absolute Minimum Annual Expenses (today's $)", cfg.get("absolute_min_annual_expenses", 0)),
+        ("Max Annual Expenses (today's $)", cfg.get("max_annual_expenses", 0)),
         ("", ""),
         ("SURVIVING SPOUSE SCENARIO (v7)", ""),
         ("Model Surviving Spouse Scenario", cfg.get("model_widow_scenario", False)),
@@ -1530,6 +1578,7 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         "Base_Expenses", "Base_Expenses_Real", "Healthcare_Cost", "HDHP", "Gifts", "Lump_Sum",
         "Discretionary_Reduction", "Guardrail_Factor", "Inflation_Frozen", "VPW_Percentage",
         "Absolute_Min_Inflated", "Absolute_Min_Bound_Hit",
+        "Max_Annual_Expenses_Inflated", "Max_Expenses_Bound_Hit",
         "PreTax_Draw", "Roth_Draw", "Cash_Draw", "HSA_Draw", "Brokerage_Draw", "Total_Draws",
         "Total_Income", "Total_Expenses", "Total_Tax", "Surplus_Deficit",
         "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool", "Return_Brokerage",
@@ -1559,7 +1608,7 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
     pct_columns = {"Effective_Tax_Rate", "Withdrawal_Rate", "Guardrail_Factor",
                    "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool",
                    "Return_Brokerage", "VPW_Percentage"}
-    bool_columns = {"IRMAA_Hit", "Bad_Return_Year", "Inflation_Frozen", "Absolute_Min_Bound_Hit"}
+    bool_columns = {"IRMAA_Hit", "Bad_Return_Year", "Inflation_Frozen", "Absolute_Min_Bound_Hit", "Max_Expenses_Bound_Hit"}
     text_columns = {"Draw_Strategy", "Filing_Status", "Deduction_Type"}
     neg_fill = PatternFill("solid", fgColor="FFE0E0")
 
@@ -1756,7 +1805,7 @@ def main():
         with st.expander("\U0001F464 Age & Timeline", expanded=True):
             current_age = st.number_input("Current Age", 45, 70, 55)
             retirement_age = st.slider("Retirement Age", 55, 63, 55)
-            planning_end = st.slider("Plan Through Age", 85, 100, 89)
+            planning_end = st.slider("Plan Through Age", 85, 100, 95)
 
         with st.expander("\U0001F5A4 Surviving Spouse Scenario"):
             st.caption("Models the 'widow's penalty': filing status switches from MFJ to Single the year after the first spouse's death, with smaller brackets/deduction, a partial Social Security survivor benefit, and (optionally) reduced pension and living costs.")
@@ -1886,6 +1935,17 @@ def main():
                      "is, so 90% of a padded budget may still be generous while 90% of a tight one "
                      "may not be livable. 0 = off (no absolute floor).",
             )
+            st.subheader("Spending Ceiling")
+            max_annual_expenses = st.number_input(
+                "Max Annual Expenses (today's $)", 0, 500_000, int(base_exp), step=5_000, format="%d",
+                help="A hard ceiling on base spending. Matters most for VPW, whose withdrawal "
+                     "percentage accelerates near the end of the plan and would otherwise force-"
+                     "spend far more than a realistic budget in the final years -- anything above "
+                     "this ceiling simply stays invested instead of being withdrawn at all. Also "
+                     "caps Guardrails' Prosperity Rule upside; a no-op for Fixed Real Spending, "
+                     "which never exceeds its own planned amount. Defaults to your Annual Expenses "
+                     "figure above. 0 = off (no ceiling).",
+            )
             st.subheader("Spending Strategy")
             spending_strategy_choice = st.radio(
                 "Strategy",
@@ -2005,6 +2065,7 @@ def main():
         performance_draw_only=perf_only,
         neg_ret_draw_reduction=neg_ret_reduction,
         absolute_min_annual_expenses=absolute_min_expenses,
+        max_annual_expenses=max_annual_expenses,
         num_children=num_kids, roth_legacy_per_child=roth_per_child,
         legacy_years=legacy_years, legacy_inflation=inflation,
         legacy_pool_return=legacy_pool_ret, legacy_pool_std=legacy_pool_std_pct,
@@ -2556,7 +2617,7 @@ def main():
         show = st.multiselect("Columns", df_disp.columns.tolist(), default=avail)
         disp = df_disp[show].copy()
         no_fmt = {"Age","Year","Years_Retired","Effective_Tax_Rate","Withdrawal_Rate",
-                  "IRMAA_Hit","Bad_Return_Year","Draw_Strategy","Inflation_Frozen","Absolute_Min_Bound_Hit",
+                  "IRMAA_Hit","Bad_Return_Year","Draw_Strategy","Inflation_Frozen","Absolute_Min_Bound_Hit","Max_Expenses_Bound_Hit",
                   "Return_PreTax","Return_Roth","Return_HSA","Return_Cash","Phase"}
         pct = {"Effective_Tax_Rate","Withdrawal_Rate","Return_PreTax","Return_Roth","Return_HSA","Return_Cash","Guardrail_Factor","VPW_Percentage"}
         fmt = {}
@@ -2594,6 +2655,8 @@ def main():
 **Surviving Spouse Scenario:** When enabled, filing status switches from MFJ to Single starting the year after the configured death age (the IRS allows MFJ in the year of death itself), pulling in single-filer federal brackets, a halved standard deduction, a halved IRMAA threshold, single Social Security taxability thresholds, and a configurable partial SS survivor benefit, pension survivor benefit, and living-expense reduction.
 
 **Spending Strategy:** Fixed Real Spending inflates your base expenses every year. Dynamic Guardrails (Guyton-Klinger style) compares last year's withdrawal rate to a band around your starting rate and applies a permanent step up/down in spending when breached, plus an Inflation Rule that cancels COLA after a down year. Variable Percentage Withdrawal (VPW, default) instead spends a percentage of your CURRENT total portfolio balance every year -- recalculated fresh annually using the same amortization math as an RMD divisor, with the percentage rising as you age -- so it self-corrects immediately with portfolio performance instead of carrying forward a permanent step the way Guyton-Klinger's cuts can. Popularized by the Bogleheads community. All three still respect the Absolute Minimum Annual Expenses floor as a hard backstop.
+
+**Spending Ceiling:** A hard maximum on base spending, in today's dollars (defaults to your Annual Expenses figure). Matters most for VPW, whose withdrawal percentage accelerates toward the end of the plan -- without a ceiling, the model would draw down and "spend" whatever the raw percentage computes even in years nobody would realistically consume that much. Money above the ceiling simply stays invested rather than being withdrawn at all, so it isn't drawn-then-unaccounted-for. Also caps Guardrails' Prosperity Rule upside; a no-op for Fixed Real Spending, which never exceeds its own planned amount.
 
 **Cash Shortfalls:** Cash is allowed to go negative to represent a genuine funding gap; it is not floored to $0, so Total_Liquid_Assets and Monte Carlo success rates reflect real shortfalls rather than hiding them.
 

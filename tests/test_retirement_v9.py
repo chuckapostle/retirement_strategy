@@ -459,6 +459,79 @@ def test_vpw_does_not_affect_other_strategies():
 
 
 # ============================================================
+# Spending ceiling (max_annual_expenses)
+# ============================================================
+
+def test_max_expenses_caps_vpw_force_spending():
+    """Regression test for the exact problem this was built to fix: VPW's
+    withdrawal percentage accelerates near the plan's end and, uncapped,
+    can force-spend (and draw) far more than a realistic budget -- a large
+    enough portfolio can even go temporarily insolvent once other expense
+    categories stack on top of a 100%-of-portfolio VPW draw. The ceiling
+    should prevent both."""
+    cfg = make_cfg(
+        spending_strategy="vpw", vpw_real_return_pct=0.04, planning_end_age=89, current_age=61,
+        pretax_401k=4_000_000, roth_ira=1_500_000, max_annual_expenses=168_000,
+    )
+    _, df = rv.run_simulation(cfg)
+    infl = cfg["inflation_rate"]
+    real_base_exp = df["Base_Expenses"] / (1 + infl) ** df["Years_Retired"]
+    assert real_base_exp.max() <= 168_000 + 1e-6
+    assert df["Max_Expenses_Bound_Hit"].any()
+    assert df["Total_Liquid_Assets"].iloc[-1] > 0  # stays solvent once capped
+
+    uncapped_cfg = {**cfg, "max_annual_expenses": 0}
+    _, df_uncapped = rv.run_simulation(uncapped_cfg)
+    assert df_uncapped["Base_Expenses"].iloc[-1] > df["Base_Expenses"].iloc[-1]
+    assert df.iloc[-1]["Total_Liquid_Assets"] > df_uncapped.iloc[-1]["Total_Liquid_Assets"]
+
+
+def test_max_expenses_disabled_by_default():
+    cfg = make_cfg(spending_strategy="fixed")  # max_annual_expenses not set
+    _, df = rv.run_simulation(cfg)
+    assert not df["Max_Expenses_Bound_Hit"].any()
+    assert (df["Max_Annual_Expenses_Inflated"] == 0).all()
+
+
+def test_max_expenses_is_a_no_op_for_fixed_spending():
+    """Fixed Real Spending never exceeds its own planned (inflated) amount,
+    so setting the ceiling exactly at that plan should never bind."""
+    cfg = make_cfg(spending_strategy="fixed", base_annual_expenses=90_000, max_annual_expenses=90_000)
+    _, df = rv.run_simulation(cfg)
+    assert not df["Max_Expenses_Bound_Hit"].any()
+
+
+def test_max_expenses_caps_guardrail_prosperity_raises():
+    cfg = make_cfg(
+        planning_end_age=90, spending_strategy="guardrails",
+        guardrail_floor_pct=0.10, guardrail_ceiling_pct=3.0,  # let the % ceiling go high
+        max_annual_expenses=90_000,  # equal to plan -- any raise above it should be capped
+    )
+    num_years = cfg["planning_end_age"] - cfg["retirement_age"] + 1
+    overrides = {k: np.full(num_years, 0.35) for k in ["pretax", "roth", "hsa", "cash", "legacy_pool", "brokerage"]}
+    _, df = rv.run_simulation(cfg, return_overrides=overrides)
+    infl = cfg["inflation_rate"]
+    real_base_exp = df["Base_Expenses"] / (1 + infl) ** df["Years_Retired"]
+    assert real_base_exp.max() <= 90_000 + 1e-6
+    assert df["Max_Expenses_Bound_Hit"].any()
+
+
+def test_max_expenses_and_absolute_min_floor_both_respected():
+    """A sane configuration (floor well below ceiling) must keep spending
+    inside [floor, ceiling] at all times."""
+    cfg = make_cfg(
+        spending_strategy="vpw", vpw_real_return_pct=0.04, planning_end_age=90, current_age=61,
+        pretax_401k=4_000_000, roth_ira=1_500_000,
+        absolute_min_annual_expenses=50_000, max_annual_expenses=168_000,
+    )
+    _, df = rv.run_simulation(cfg)
+    infl = cfg["inflation_rate"]
+    real_base_exp = df["Base_Expenses"] / (1 + infl) ** df["Years_Retired"]
+    assert real_base_exp.min() >= 50_000 - 1e-6
+    assert real_base_exp.max() <= 168_000 + 1e-6
+
+
+# ============================================================
 # Tax-year governance (Phase 3)
 # ============================================================
 # Tests the verify_tax_constants() MECHANISM (does it correctly compare
