@@ -2427,12 +2427,16 @@ def main():
                 base0 = cfg["base_annual_expenses"]
                 worst_ratios = np.array([r["Base_Expenses_Real"].min() / base0 for r in survived_runs])
                 m4.metric("Worst Real Spending (median, successful paths)",
-                          f"{np.percentile(worst_ratios, 50) * 100:.0f}% of plan",
+                          f"{np.percentile(worst_ratios, 50) * 100:.0f}% of Annual Expenses target",
                           help="Among the paths that 'succeeded' (portfolio > $0 at the final age), "
                                "the median of each path's own lowest real (today's $) annual spending "
-                               "level, as a % of what you originally planned to spend. A high success "
-                               "rate next to a low number here means the strategy is buying that "
-                               "survival by cutting your lifestyle, not the portfolio holding up.")
+                               "level, as a % of your Annual Expenses input. For Fixed/Guardrails "
+                               "that input is the literal target the strategy tries to sustain; VPW "
+                               "has no fixed target at all (it deliberately floats with the "
+                               "portfolio), so here it's just a reference point, not a goal the "
+                               "strategy is failing to hit. A high success rate next to a low number "
+                               "here means the strategy is buying that survival by cutting your "
+                               "lifestyle, not the portfolio holding up.")
 
             bands = compute_percentile_bands(mc_runs, "Total_Liquid_Assets")
             ages = bands["Age"]
@@ -2460,7 +2464,7 @@ def main():
                 fill="toself", fillcolor="rgba(231,76,60,0.25)", line=dict(color="rgba(255,255,255,0)"), name="25-75%"))
             fig_exp.add_trace(go.Scatter(x=ages, y=bands_exp["p50"], name="Median", line=dict(color="darkred", width=2)))
             fig_exp.add_hline(y=cfg["base_annual_expenses"], line_dash="dash", line_color="black",
-                               annotation_text="Original Plan (today's $)")
+                               annotation_text="Annual Expenses Target (today's $)")
             fig_exp.update_layout(title="Actual Lifestyle Spending Across Simulations (Today's $)",
                                   yaxis_tickformat="$,.0f", height=420)
             st.plotly_chart(fig_exp, use_container_width=True)
@@ -2468,10 +2472,13 @@ def main():
                 "'Success' above only means the portfolio balance stayed above $0 at the final age -- "
                 "it says nothing about how much spending had to be cut to get there. This chart shows "
                 "the actual lifestyle spending (base expenses, today's dollars) each simulation lived "
-                "on. If this band sags far below the original-plan line while the success rate still "
-                "looks good, the strategy is buying survival by cutting your lifestyle, not because the "
-                "portfolio actually held up -- consider setting an Absolute Minimum Annual Expenses "
-                "(Expenses tab) or tightening the Cumulative Spending Bound (Spending Strategy)."
+                "on, against your Annual Expenses input as a reference line (not a target VPW is "
+                "trying to hit -- it deliberately floats with the portfolio; the line is there so you "
+                "can judge the gap either way). If this band sags far below that line while the "
+                "success rate still looks good, the strategy is buying survival by cutting your "
+                "lifestyle, not because the portfolio actually held up -- consider setting an Absolute "
+                "Minimum Annual Expenses floor (Expenses tab), or a lower Max Annual Expenses ceiling "
+                "if the concern runs the other way and spending is instead being pushed too high."
             )
 
             n_show = min(20, len(mc_runs))
