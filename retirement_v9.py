@@ -7,6 +7,45 @@ Usage:
   pip install streamlit plotly pandas numpy openpyxl
   streamlit run retirement_v9.py
 
+v10 enhancements (perf/caching + financial modeling, on top of v9):
+  1. Monte Carlo and the scenario optimizer no longer recompute the
+     (deterministic) accumulation phase on every single simulation --
+     hoisted out and computed once (or once per unique retirement_age for
+     the optimizer), a substantial speedup at high sim counts.
+  2. run_simulation/run_monte_carlo/run_optimizer are now cached across
+     Streamlit reruns (@st.cache_data), so moving a widget that doesn't
+     change the underlying scenario (e.g. the "Today's Dollars" display
+     toggle) no longer re-triggers a full Monte Carlo run. A seed of 0
+     ("random") is deliberately left uncached so it keeps drawing fresh
+     paths on every rerun, same as before.
+  3. New taxable brokerage account bucket: sits between Cash and Roth in
+     the draw order, tracks a running cost basis, realizes long-term
+     capital gains on withdrawal taxed via the IRS "stacked on top of
+     ordinary income" method (federal preferential rates; Oregon taxes it
+     as ordinary income, no LTCG preference), and gets a full basis
+     step-up at death like Roth/cash (unlike PreTax/HSA). Wired into
+     Monte Carlo correlation, sensitivity analysis, and Excel export.
+  4. Guyton-Klinger guardrails gained the "Inflation Rule": spending can
+     now also skip a year's COLA following a negative portfolio return,
+     alongside the existing capital-preservation/prosperity rules and the
+     v8 cumulative floor/ceiling.
+  5. Removed dead scaffolding that was computed but never used anywhere
+     (FPL_700/Under_700_FPL and several other never-populated columns
+     left over from an earlier version).
+  6. Fixed a stale hardcoded base_year=2024 (now CURRENT_YEAR, computed
+     live) -- cosmetic only (displayed Year column); tracing the math
+     confirms no tax/dollar calculation ever depended on the specific
+     value, since it always cancels out of the year-offset (yfb/yir) math.
+  7. Added TAX_YEAR + verify_tax_constants(): a runtime banner that warns
+     when nobody has re-verified the hardcoded federal/Oregon/LTCG
+     bracket and IRMAA figures against actual current-year IRS/SSA
+     numbers -- these are annually-adjusted figures baked in as of
+     TAX_YEAR and will silently go stale otherwise.
+  8. Added a pytest regression suite (tests/test_retirement_v9.py)
+     covering the RMD table, Social Security taxability tiers, the tax
+     engine, guardrail floor/ceiling, the new brokerage/LTCG math, the
+     Inflation Rule, and the tax-year verifier.
+
 v9 fix:
 1. "Discretionary Draw Reduction if Year Return < 0" was a fixed nominal
 dollar amount for the entire plan, while base_annual_expenses (and every
@@ -124,6 +163,18 @@ from pathlib import Path
 # anchor, which cancel it out, so this never affects any dollar figure.
 CURRENT_YEAR = date.today().year
 
+# The year FEDERAL_BRACKETS, SINGLE_FEDERAL_BRACKETS, OREGON_BRACKETS,
+# LTCG_BRACKETS/SINGLE_LTCG_BRACKETS, IRMAA_MAGI_THRESHOLD*,
+# IRMAA_MONTHLY_SURCHARGE, and the UI's default standard_deduction were last
+# checked against actual IRS Rev. Proc. / SSA COLA figures. Unlike
+# CURRENT_YEAR, this does NOT auto-update -- it's a manual marker, bumped
+# only when someone has actually re-verified the numbers below. Every
+# *future* simulated year is already correctly inflated forward from
+# whatever's here via bracket_inflation/inflation_rate regardless of how
+# stale TAX_YEAR gets; what goes stale is the CURRENT-YEAR baseline every
+# projection is anchored to. See verify_tax_constants() below.
+TAX_YEAR = 2026
+
 RMD_TABLE = {
     72: 27.4, 73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9,
     78: 22.0, 79: 21.1, 80: 20.2, 81: 19.4, 82: 18.5, 83: 17.7,
@@ -174,6 +225,28 @@ LTCG_BRACKETS = [
 SINGLE_LTCG_BRACKETS = [
     (0.00, 48_350), (0.15, 533_400), (0.20, float("inf")),
 ]
+
+def verify_tax_constants():
+    """Returns a warning string if nobody has bumped TAX_YEAR since the real
+    calendar rolled past it -- i.e. the CURRENT-year tax-law baseline this
+    whole projection is anchored to hasn't been checked against actual IRS/
+    SSA figures for the year we're actually in. Returns None when current.
+    A runtime nag, not a correctness guarantee: bumping TAX_YEAR without
+    actually updating the bracket constants below silences this without
+    fixing anything -- it only proves someone looked, not that the numbers
+    are right."""
+    current_year = date.today().year
+    if current_year <= TAX_YEAR:
+        return None
+    years_stale = current_year - TAX_YEAR
+    return (
+        f"Tax-law constants were last verified for {TAX_YEAR}, but it's now {current_year} "
+        f"({years_stale} year{'s' if years_stale != 1 else ''} stale). FEDERAL_BRACKETS, "
+        f"SINGLE_FEDERAL_BRACKETS, OREGON_BRACKETS, LTCG_BRACKETS/SINGLE_LTCG_BRACKETS, "
+        f"IRMAA_MAGI_THRESHOLD*, IRMAA_MONTHLY_SURCHARGE, and the default standard deduction "
+        f"are all annually-adjusted figures -- check them against the current year's IRS Rev. "
+        f"Proc. and SSA COLA announcement, then bump TAX_YEAR."
+    )
 
 # ============================================================
 # TAX ENGINE
@@ -1540,6 +1613,10 @@ def main():
                        layout="wide", initial_sidebar_state="expanded")
     st.title("\U0001F3E6 Retirement Income & Tax Planning Simulator")
     st.caption("Accumulation + Retirement modeling with Monte Carlo and Excel export")
+
+    tax_staleness_warning = verify_tax_constants()
+    if tax_staleness_warning:
+        st.warning(tax_staleness_warning, icon="⚠️")
 
     with st.sidebar:
         st.header("\u2699\ufe0f Configuration")

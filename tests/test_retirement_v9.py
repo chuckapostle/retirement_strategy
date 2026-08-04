@@ -300,3 +300,45 @@ def test_fixed_spending_unaffected_by_inflation_rule_toggle():
     base, infl = cfg["base_annual_expenses"], cfg["inflation_rate"]
     expected = [base * (1 + infl) ** i for i in range(len(df))]
     assert df["Base_Expenses"].tolist() == pytest.approx(expected)
+
+
+# ============================================================
+# Tax-year governance (Phase 3)
+# ============================================================
+# Tests the verify_tax_constants() MECHANISM (does it correctly compare
+# TAX_YEAR to the real current year), not a claim that the tax-law
+# constants themselves stay eternally fresh -- that still requires an
+# annual human check. TAX_YEAR is monkeypatched (and restored) rather than
+# faking "today", since the function only ever reads date.today().year.
+
+def test_verify_tax_constants_silent_when_current_or_future():
+    orig = rv.TAX_YEAR
+    try:
+        rv.TAX_YEAR = rv.date.today().year
+        assert rv.verify_tax_constants() is None
+        rv.TAX_YEAR = rv.date.today().year + 1
+        assert rv.verify_tax_constants() is None
+    finally:
+        rv.TAX_YEAR = orig
+
+
+def test_verify_tax_constants_warns_when_stale():
+    orig = rv.TAX_YEAR
+    try:
+        rv.TAX_YEAR = rv.date.today().year - 2
+        msg = rv.verify_tax_constants()
+        assert msg is not None
+        assert "2 years stale" in msg
+        assert "FEDERAL_BRACKETS" in msg  # names what actually needs checking
+    finally:
+        rv.TAX_YEAR = orig
+
+
+def test_verify_tax_constants_singular_year_wording():
+    orig = rv.TAX_YEAR
+    try:
+        rv.TAX_YEAR = rv.date.today().year - 1
+        msg = rv.verify_tax_constants()
+        assert "1 year stale" in msg  # not "1 years stale"
+    finally:
+        rv.TAX_YEAR = orig
