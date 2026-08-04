@@ -1577,7 +1577,7 @@ def qp_float(name, default):
 
 def get_balance_source(file_balances):
     qp = st.query_params
-    web_keys = ["pretax", "roth", "hsa", "s5", "s10", "cash"]
+    web_keys = ["pretax", "roth", "hsa", "s5", "s10", "brokerage", "cash"]
     if any(str(qp.get(k, "")).strip() for k in web_keys):
         return "web fetch from Excel"
     if any(v is not None for v in file_balances.values()):
@@ -1652,6 +1652,7 @@ def main():
                 ("hsa_input", "hsa", file_balances["hsa"] if file_balances["hsa"] is not None else 130_000),
                 ("s5_input", "s5", file_balances["s_plus_5"] if file_balances["s_plus_5"] is not None else 300_000),
                 ("s10_input", "s10", file_balances["s_plus_10"] if file_balances["s_plus_10"] is not None else 400_000),
+                ("brokerage_input", "brokerage", file_balances["brokerage"] if file_balances["brokerage"] is not None else 0),
                 ("cash_input", "cash", file_balances["cash"] if file_balances["cash"] is not None else 745_000),
             ]
             for widget_key, param_name, fallback in balance_specs:
@@ -1665,32 +1666,14 @@ def main():
             hsa_bal = st.number_input("HSA ($)", 0, 500_000, step=10_000, format="%d", key="hsa_input")
             s5_bal = st.number_input("S+ 5-Year Payout ($)", 0, 2_000_000, step=25_000, format="%d", key="s5_input")
             s10_bal = st.number_input("S+ 10-Year Payout ($)", 0, 2_000_000, step=25_000, format="%d", key="s10_input")
-            cash_bal = st.number_input("Cash ($)", 0, 1_000_000, step=10_000, format="%d", key="cash_input")
-
-        with st.expander("\U0001F4B9 Taxable Brokerage"):
-            st.caption(
-                "A separate, non-tax-advantaged investment account. Contributed "
-                "dollars come back tax-free on withdrawal; growth comes back as a "
-                "taxed long-term capital gain. Sits between Cash and Roth in the "
-                "draw order, and gets a full cost-basis step-up at death (unlike "
-                "PreTax/HSA) -- see the Tax and Legacy tabs."
-            )
             brokerage_bal = st.number_input(
-                "Starting Balance ($)",
-                0, 5_000_000,
-                file_balances.get("brokerage") if file_balances.get("brokerage") is not None else 0,
-                step=25_000, format="%d", key="brokerage_input",
+                "Taxable Brokerage ($)", 0, 5_000_000, step=25_000, format="%d", key="brokerage_input",
+                help="A separate, non-tax-advantaged account. Contributed dollars come back "
+                     "tax-free; growth is taxed as a long-term capital gain when withdrawn. "
+                     "Sits between Cash and Roth in the draw order, and gets a full cost-basis "
+                     "step-up at death (unlike PreTax/HSA) -- see the Tax and Legacy tabs.",
             )
-            brokerage_basis_pct = st.slider(
-                "Starting Cost Basis (% of balance)", 0, 100, 100, 5,
-                help="100% = no embedded gain today (e.g. a brand-new account or "
-                     "one you're funding from cash). Lower this if the account "
-                     "already holds unrealized gains.",
-            )
-            brokerage_basis = brokerage_bal * brokerage_basis_pct / 100
-            c_brokerage = st.number_input("Annual Contribution (Working Years) ($)", 0, 200_000, 0, step=5_000, format="%d")
-            brokerage_ret = st.slider("Target Return %", 0.0, 12.0, 7.0, 0.5) / 100
-            brokerage_std_pct = st.slider("Return Std Dev % (Monte Carlo)", 1.0, 25.0, 15.0, 0.5) / 100
+            cash_bal = st.number_input("Cash ($)", 0, 1_000_000, step=10_000, format="%d", key="cash_input")
 
         with st.expander("\U0001F4BC Working Years Contributions"):
             st.caption(f"Annual contributions for {max(0, retirement_age - current_age)} remaining working years")
@@ -1703,12 +1686,23 @@ def main():
             st.divider()
             c_cash = st.number_input("Annual Cash Savings ($)", 0, 500_000, 150_000, step=5_000, format="%d")
             c_cash_lump = st.number_input("Final Year Cash Lump ($)", 0, 500_000, 120_000, step=10_000, format="%d")
+            st.divider()
+            brokerage_basis_pct = st.slider(
+                "Brokerage Starting Cost Basis (% of balance)", 0, 100, 100, 5,
+                help="100% = no embedded gain today (e.g. a brand-new account or one "
+                     "you're funding from cash). Lower this if the account already "
+                     "holds unrealized gains.",
+            )
+            brokerage_basis = brokerage_bal * brokerage_basis_pct / 100
+            c_brokerage = st.number_input("Brokerage Annual Contribution ($)", 0, 200_000, 0, step=5_000, format="%d")
 
         with st.expander("\U0001F4C8 Performance Assumptions"):
             pretax_ret = st.slider("PreTax Target Return %", 0.0, 12.0, 6.0, 0.5) / 100
             roth_ret = st.slider("Roth Target Return %", 0.0, 12.0, 7.0, 0.5) / 100
             hsa_ret = st.slider("HSA Target Return %", 0.0, 12.0, 5.0, 0.5) / 100
             cash_ret = st.slider("Cash/MM Target Return %", 0.0, 8.0, 4.0, 0.25) / 100
+            brokerage_ret = st.slider("Brokerage Target Return %", 0.0, 12.0, 7.0, 0.5) / 100
+            brokerage_std_pct = st.slider("Brokerage Return Std Dev % (Monte Carlo)", 1.0, 25.0, 15.0, 0.5) / 100
 
         with st.expander("\U0001F3B2 Monte Carlo Settings"):
             mc_enabled = st.checkbox("Enable Monte Carlo", value=True)
