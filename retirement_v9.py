@@ -111,14 +111,18 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from typing import Dict, List, Tuple
 import io
-import os
+from datetime import date
 from pathlib import Path
 
 # ============================================================
 # CONSTANTS
 # ============================================================
+
+# Anchors the displayed "Year" column to the real current year. Purely
+# cosmetic -- all tax-timing math uses year-offsets (yfb/yir) from this
+# anchor, which cancel it out, so this never affects any dollar figure.
+CURRENT_YEAR = date.today().year
 
 RMD_TABLE = {
     72: 27.4, 73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9,
@@ -308,7 +312,7 @@ def run_accumulation(cfg):
     """Grow balances from current age to retirement with contributions."""
     cur_age = cfg["current_age"]
     ret_age = cfg["retirement_age"]
-    base_year = 2024
+    base_year = CURRENT_YEAR
     years = ret_age - cur_age
     if years <= 0:
         return [], cfg["pretax_401k"], cfg["roth_ira"], cfg["hsa"], cfg["cash"], cfg["s_plus_5yr"], cfg["s_plus_10yr"]
@@ -380,9 +384,9 @@ def run_accumulation(cfg):
 # RETIREMENT SIMULATION ENGINE
 # ============================================================
 
-def run_simulation(cfg, return_overrides=None):
+def run_simulation(cfg, return_overrides=None, accum_result=None):
     results = []
-    base_year = 2024
+    base_year = CURRENT_YEAR
     ret_age = cfg["retirement_age"]
     cur_age = cfg["current_age"]
     end_age = cfg["planning_end_age"]
@@ -391,8 +395,15 @@ def run_simulation(cfg, return_overrides=None):
     binfl = cfg["bracket_inflation"]
     num_years = end_age - ret_age + 1
 
-    # Run accumulation phase to get retirement-day balances
-    accum_rows, pt, ro, hs, ca, s5_bal, s10_bal = run_accumulation(cfg)
+    # Accumulation phase is deterministic given cfg -- it never reads
+    # return_overrides -- so it's identical across every Monte Carlo path
+    # and across every optimizer combo that shares the same retirement_age.
+    # Callers that run many simulations against the same cfg can compute it
+    # once and pass it in via accum_result instead of recomputing it on
+    # every single call (run_monte_carlo, run_optimizer both do this).
+    if accum_result is None:
+        accum_result = run_accumulation(cfg)
+    accum_rows, pt, ro, hs, ca, s5_bal, s10_bal = accum_result
     cash_basis = float(accum_rows[-1].get("Cash_Basis", cfg["cash"])) if accum_rows else float(cfg["cash"])
 
     # S+ payout tracking
@@ -858,9 +869,10 @@ def run_simulation(cfg, return_overrides=None):
                 initial_wr = row["Withdrawal_Rate"]
             prev_wr = row["Withdrawal_Rate"]
 
-        br12 = bracket_ceiling(fed_brackets_yr, 0.12, yfb, binfl)
+        # br12_gross already computed above (same fed_brackets_yr/yfb/binfl
+        # this year) -- reused here instead of recomputing.
         br22 = bracket_ceiling(fed_brackets_yr, 0.22, yfb, binfl)
-        row["Bracket_12_Ceiling"], row["Bracket_22_Ceiling"] = br12, br22
+        row["Bracket_12_Ceiling"], row["Bracket_22_Ceiling"] = br12_gross, br22
 
         results.append(row)
 
@@ -874,10 +886,13 @@ def run_simulation(cfg, return_overrides=None):
 def run_monte_carlo(cfg, n_sims, std_dev, max_up, seed=None, correlation=0.85, fat_tailed=False, t_df=5):
     rng = np.random.default_rng(seed)
     num_years = cfg["planning_end_age"] - cfg["retirement_age"] + 1
+    # Accumulation is identical across every path (see run_simulation) --
+    # compute it once instead of n_sims times.
+    accum_result = run_accumulation(cfg)
     all_runs = []
     for _ in range(n_sims):
         ov = build_mc_return_overrides(cfg, num_years, rng, std_dev, max_up, correlation, fat_tailed, t_df)
-        _, df = run_simulation(cfg, return_overrides=ov)
+        _, df = run_simulation(cfg, return_overrides=ov, accum_result=accum_result)
         all_runs.append(df)
     return all_runs
 
@@ -913,6 +928,15 @@ def run_optimizer(base_cfg, mc_sims, mc_std, mc_max, mc_seed, correlation=0.85, 
     results = []
     total_combos = len(ret_ages) * len(ss_ages) * len(reductions)
 
+    # Accumulation only depends on retirement_age among the swept variables
+    # (ss_start_age/expense_reduction_post80 never touch it) -- compute it
+    # once per unique retirement_age instead of once per combo per sim
+    # (len(ret_ages) calls instead of up to total_combos * opt_sims).
+    accum_cache = {
+        ret_age: run_accumulation({**base_cfg, "retirement_age": ret_age})
+        for ret_age in ret_ages
+    }
+
     for ret_age in ret_ages:
         for ss_age in ss_ages:
             if ss_age < ret_age:
@@ -932,7 +956,7 @@ def run_optimizer(base_cfg, mc_sims, mc_std, mc_max, mc_seed, correlation=0.85, 
 
                 for _ in range(opt_sims):
                     ov = build_mc_return_overrides(test_cfg, num_years, rng, mc_std, mc_max, correlation, fat_tailed, t_df)
-                    _, sim_df = run_simulation(test_cfg, return_overrides=ov)
+                    _, sim_df = run_simulation(test_cfg, return_overrides=ov, accum_result=accum_cache[ret_age])
                     last = sim_df.iloc[-1]
                     if last["Total_Liquid_Assets"] > 0:
                         survived += 1
@@ -1358,6 +1382,30 @@ def get_balance_source(file_balances):
         return "using Starting_balances.txt"
     return "using defaults"
 
+
+# ── Cached wrappers ──
+# Streamlit reruns the whole script on every widget interaction, so without
+# caching, moving a slider that doesn't even affect `cfg` (e.g. the "Show in
+# Today's Dollars" display toggle) still re-triggers a full deterministic
+# run plus a full Monte Carlo of up to mc_sims paths. These wrappers key off
+# the actual arguments, so a rerun with an unchanged cfg is a cache hit.
+@st.cache_data(show_spinner=False)
+def cached_run_simulation(cfg):
+    return run_simulation(cfg)
+
+
+@st.cache_data(show_spinner="Running Monte Carlo simulation...")
+def cached_run_monte_carlo(cfg, n_sims, std_dev, max_up, seed, correlation, fat_tailed, t_df):
+    return run_monte_carlo(cfg, n_sims, std_dev, max_up, seed=seed,
+                            correlation=correlation, fat_tailed=fat_tailed, t_df=t_df)
+
+
+@st.cache_data(show_spinner=False)
+def cached_run_optimizer(cfg, mc_sims, mc_std, mc_max, mc_seed, correlation, fat_tailed, t_df):
+    return run_optimizer(cfg, mc_sims, mc_std, mc_max, mc_seed,
+                          correlation=correlation, fat_tailed=fat_tailed, t_df=t_df)
+
+
 def main():
     st.set_page_config(page_title="Retirement Income Planner", page_icon="\U0001F4CA",
                        layout="wide", initial_sidebar_state="expanded")
@@ -1565,12 +1613,22 @@ def main():
     )
 
     # ── RUN ──
-    accum_rows, df = run_simulation(cfg)
+    accum_rows, df = cached_run_simulation(cfg)
     accum_df = pd.DataFrame(accum_rows) if accum_rows else None
     mc_runs = None
     if mc_enabled:
-        mc_runs = run_monte_carlo(cfg, mc_sims, mc_std, mc_max, seed=mc_seed if mc_seed > 0 else None,
-                                   correlation=mc_correlation, fat_tailed=mc_fat_tailed, t_df=mc_t_df)
+        if mc_seed > 0:
+            # A fixed seed makes the run fully deterministic given cfg, so
+            # it's safe -- and often the difference between an instant
+            # rerun and a multi-second one -- to cache.
+            mc_runs = cached_run_monte_carlo(cfg, mc_sims, mc_std, mc_max, mc_seed,
+                                              mc_correlation, mc_fat_tailed, mc_t_df)
+        else:
+            # Seed 0 means "random": each rerun should draw a genuinely new
+            # set of paths, same as before caching was added -- caching this
+            # would freeze the "random" run to whatever it first computed.
+            mc_runs = run_monte_carlo(cfg, mc_sims, mc_std, mc_max, seed=None,
+                                       correlation=mc_correlation, fat_tailed=mc_fat_tailed, t_df=mc_t_df)
 
     # ── DEFLATOR (today's dollars conversion) ──
     # When show_real is True, deflate future dollar amounts back to present value
@@ -1929,8 +1987,8 @@ def main():
 
             if st.button("Run Optimizer", type="primary"):
                 with st.spinner("Running scenario sweep (this takes a moment)..."):
-                    opt_df = run_optimizer(cfg, mc_sims, mc_std, mc_max, mc_seed,
-                                            correlation=mc_correlation, fat_tailed=mc_fat_tailed, t_df=mc_t_df)
+                    opt_df = cached_run_optimizer(cfg, mc_sims, mc_std, mc_max, mc_seed,
+                                                   mc_correlation, mc_fat_tailed, mc_t_df)
 
                 # ── Current scenario baseline ──
                 surv = sum(1 for r in mc_runs if r.iloc[-1]["Total_Liquid_Assets"] > 0)
