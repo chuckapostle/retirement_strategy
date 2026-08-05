@@ -39,15 +39,12 @@ def make_cfg(**overrides):
         rmd_start_age=75, draw_order=["pretax", "cash", "roth", "hsa"],
         roth_conversion_enabled=False, roth_conversion_target_bracket="12%",
         roth_conversion_margin=100_000, irmaa_avoidance=True,
-        performance_draw_only=False,
         neg_ret_draw_reduction=0,
         num_children=0, roth_legacy_per_child=0,
         legacy_years=0, legacy_inflation=0.03,
         legacy_pool_return=0.07, legacy_pool_std=0.12,
         heir_tax_rate=0.24,
         spending_strategy="fixed",
-        guardrail_band_pct=0.20, guardrail_adjustment_pct=0.10,
-        guardrail_floor_pct=0.60, guardrail_ceiling_pct=1.50,
         model_widow_scenario=False, first_death_age=999,
         ss_survivor_pct=0.65, jss_survivor_pct=1.0,
         expense_reduction_widowhood=0.0,
@@ -141,70 +138,6 @@ def test_bracket_ceiling_inflates_with_yrs_and_infl():
 
 
 # ============================================================
-# Guardrails floor/ceiling (the v8 fix)
-# ============================================================
-
-def _flat_return_overrides(num_years, rate):
-    return {k: np.full(num_years, rate) for k in ["pretax", "roth", "hsa", "cash", "legacy_pool"]}
-
-
-def test_guardrail_factor_never_breaches_floor_on_sustained_down_years():
-    cfg = make_cfg(
-        planning_end_age=90, spending_strategy="guardrails",
-        guardrail_floor_pct=0.50, guardrail_ceiling_pct=1.50,
-    )
-    num_years = cfg["planning_end_age"] - cfg["retirement_age"] + 1
-    overrides = _flat_return_overrides(num_years, -0.30)
-    _, df = rv.run_simulation(cfg, return_overrides=overrides)
-    assert df["Guardrail_Factor"].min() >= cfg["guardrail_floor_pct"] - 1e-9
-    assert df["Guardrail_Factor"].max() <= cfg["guardrail_ceiling_pct"] + 1e-9
-
-
-def test_guardrail_factor_never_breaches_ceiling_on_sustained_up_years():
-    cfg = make_cfg(
-        planning_end_age=90, spending_strategy="guardrails",
-        guardrail_floor_pct=0.50, guardrail_ceiling_pct=1.50,
-    )
-    num_years = cfg["planning_end_age"] - cfg["retirement_age"] + 1
-    overrides = _flat_return_overrides(num_years, 0.35)
-    _, df = rv.run_simulation(cfg, return_overrides=overrides)
-    assert df["Guardrail_Factor"].min() >= cfg["guardrail_floor_pct"] - 1e-9
-    assert df["Guardrail_Factor"].max() <= cfg["guardrail_ceiling_pct"] + 1e-9
-    # The sustained-up scenario should actually reach the ceiling, not just
-    # stay safely under it -- otherwise this test wouldn't be exercising the
-    # v8 bound at all.
-    assert df["Guardrail_Factor"].iloc[-1] == pytest.approx(cfg["guardrail_ceiling_pct"])
-
-
-def test_real_spending_never_breaches_floor_with_inflation_rule_and_mixed_years():
-    """Regression test for a real bug: the Inflation Rule originally applied
-    via a separate, unbounded freeze on the spending base, so ACTUAL REAL
-    spending could fall well below guardrail_floor_pct even though
-    Guardrail_Factor itself still reported a compliant value (verified
-    empirically: median real spending among 'successful' MC paths fell to
-    ~40% of plan against a configured 50% floor). A scattered mix of
-    down/up years -- not a sustained monotonic run -- is what actually
-    triggered it, since a sustained-down scenario saturates the floor via
-    the withdrawal-rate rule alone regardless of the Inflation Rule's
-    separate contribution. Now both rules move the same bounded number, so
-    this must hold exactly."""
-    cfg = make_cfg(
-        planning_end_age=90, spending_strategy="guardrails",
-        guardrail_inflation_rule=True,
-        guardrail_floor_pct=0.50, guardrail_ceiling_pct=1.50,
-    )
-    num_years = cfg["planning_end_age"] - cfg["retirement_age"] + 1
-    rng = np.random.default_rng(7)
-    rates = rng.choice([-0.20, -0.05, 0.06, 0.15], size=num_years)
-    overrides = {k: rates.copy() for k in ["pretax", "roth", "hsa", "cash", "legacy_pool", "brokerage"]}
-    _, df = rv.run_simulation(cfg, return_overrides=overrides)
-
-    base, infl = cfg["base_annual_expenses"], cfg["inflation_rate"]
-    real_ratio = (df["Base_Expenses"] / (1 + infl) ** df["Years_Retired"]) / base
-    assert real_ratio.min() >= cfg["guardrail_floor_pct"] - 1e-6
-
-
-# ============================================================
 # Smoke test / regression pin
 # ============================================================
 
@@ -290,76 +223,8 @@ def test_calc_ltcg_tax_zero_for_nonpositive_gain():
 
 
 # ============================================================
-# Guyton-Klinger Inflation Rule (Phase 2)
-# ============================================================
-
-def test_guardrail_inflation_rule_freezes_cola_the_year_after_a_down_year():
-    """guardrail_band_pct=100 makes the WR-based capital-preservation/
-    prosperity rule un-triggerable (no realistic withdrawal rate will ever
-    breach a +/-100x band), isolating the Inflation Rule as the only thing
-    that can move Guardrail_Factor/Base_Expenses away from a plain
-    compounding series. The Inflation Rule now applies AS a guardrail_factor
-    adjustment (guardrail_factor /= (1+infl) the year after a down year),
-    not a separate unbounded freeze -- so Guardrail_Factor permanently steps
-    to 1/(1+infl) starting the year the rule fires, same permanent-step
-    semantics as the WR-driven rule, and Base_Expenses is exactly one year
-    'behind' where it would otherwise be, forever after."""
-    cfg = make_cfg(
-        planning_end_age=65, spending_strategy="guardrails",
-        guardrail_band_pct=100.0, guardrail_inflation_rule=True,
-        guardrail_floor_pct=0.50, guardrail_ceiling_pct=1.50,
-        inflation_rate=0.03,
-    )
-    n = cfg["planning_end_age"] - cfg["retirement_age"] + 1
-    returns = np.full(n, 0.06)
-    returns[1] = -0.10  # bad return in the 2nd simulated year (index 1)
-    overrides = {k: returns.copy() for k in ["pretax", "roth", "hsa", "cash", "legacy_pool", "brokerage"]}
-    _, df = rv.run_simulation(cfg, return_overrides=overrides)
-
-    base, infl = cfg["base_annual_expenses"], cfg["inflation_rate"]
-    expected_gf = [1.0, 1.0, 1 / (1 + infl), 1 / (1 + infl), 1 / (1 + infl)]
-    assert df["Guardrail_Factor"].tolist() == pytest.approx(expected_gf)
-    assert df["Inflation_Frozen"].tolist() == [False, False, True, False, False]
-
-    expected_base_exp = [base * (1 + infl) ** yir * gf for yir, gf in enumerate(expected_gf)]
-    assert df["Base_Expenses"].tolist() == pytest.approx(expected_base_exp)
-    # Years 1 and 2 land on the exact same nominal amount (the freeze), then
-    # spending resumes compounding forward from that frozen level -- a
-    # permanent one-year setback, not a one-time blip.
-    assert df["Base_Expenses"].iloc[1] == pytest.approx(df["Base_Expenses"].iloc[2])
-    assert df["Base_Expenses"].iloc[3] == pytest.approx(df["Base_Expenses"].iloc[2] * (1 + infl))
-
-
-def test_fixed_spending_unaffected_by_inflation_rule_toggle():
-    """guardrail_inflation_rule only has teeth when spending_strategy is
-    'guardrails' -- Fixed Real Spending must inflate every year regardless."""
-    cfg = make_cfg(spending_strategy="fixed", guardrail_inflation_rule=True)
-    _, df = rv.run_simulation(cfg)
-    assert not df["Inflation_Frozen"].any()
-    base, infl = cfg["base_annual_expenses"], cfg["inflation_rate"]
-    expected = [base * (1 + infl) ** i for i in range(len(df))]
-    assert df["Base_Expenses"].tolist() == pytest.approx(expected)
-
-
-# ============================================================
 # Absolute survival floor (absolute_min_annual_expenses)
 # ============================================================
-
-def test_absolute_min_floor_overrides_a_deep_guardrail_cut():
-    cfg = make_cfg(
-        planning_end_age=90, spending_strategy="guardrails",
-        guardrail_floor_pct=0.10, guardrail_ceiling_pct=1.50,  # let % cuts go deep
-        absolute_min_annual_expenses=70_000,  # well above 10% of the 90k plan
-    )
-    num_years = cfg["planning_end_age"] - cfg["retirement_age"] + 1
-    overrides = {k: np.full(num_years, -0.30) for k in ["pretax", "roth", "hsa", "cash", "legacy_pool", "brokerage"]}
-    _, df = rv.run_simulation(cfg, return_overrides=overrides)
-
-    infl = cfg["inflation_rate"]
-    real_base_exp = df["Base_Expenses"] / (1 + infl) ** df["Years_Retired"]
-    assert real_base_exp.min() >= 70_000 - 1e-6
-    assert df["Absolute_Min_Bound_Hit"].any()  # confirms the floor actually engaged
-
 
 def test_absolute_min_floor_disabled_by_default():
     cfg = make_cfg(spending_strategy="fixed")  # absolute_min_annual_expenses not set
@@ -408,13 +273,13 @@ def test_vpw_base_expenses_matches_pct_of_pre_draw_balance_in_year_zero():
     assert row0["Base_Expenses"] == pytest.approx(starting_total * expected_pct)
 
 
-def test_vpw_self_corrects_without_a_permanent_step_unlike_guardrails():
+def test_vpw_self_corrects_without_a_permanent_step():
     """The core claim behind recommending VPW: a bad year changes next
     year's dollar amount because the portfolio shrank, not because of any
     persistent multiplier -- so a rebound that offsets the loss (relative to
     the flat-return baseline path -- -20% then +40.45% cancels out against
     two years of flat +6%, since 0.8*1.4045=1.06*1.06) restores spending to
-    ~parity, unlike Guyton-Klinger's permanent step-down."""
+    ~parity."""
     cfg = make_cfg(spending_strategy="vpw", vpw_real_return_pct=0.04, planning_end_age=85, current_age=61)
     n = cfg["planning_end_age"] - cfg["retirement_age"] + 1
     down_then_up = np.full(n, 0.06)
@@ -430,8 +295,7 @@ def test_vpw_self_corrects_without_a_permanent_step_unlike_guardrails():
     # Year 1 (the bad year) should show reduced spending vs the flat baseline.
     assert df_shock["Base_Expenses"].iloc[1] < df_flat["Base_Expenses"].iloc[1]
     # By year 3 (one year after the offsetting rebound), VPW should have
-    # already closed nearly all of the gap -- no lingering "stuck" reduction
-    # the way a guardrail step-cut would leave behind.
+    # already closed nearly all of the gap -- no lingering "stuck" reduction.
     ratio = df_shock["Base_Expenses"].iloc[3] / df_flat["Base_Expenses"].iloc[3]
     assert ratio > 0.98
 
@@ -450,10 +314,10 @@ def test_vpw_respects_absolute_min_floor():
 
 
 def test_vpw_does_not_affect_other_strategies():
-    """Adding VPW as a new opt-in branch must not change Fixed/Guardrails
+    """Adding VPW as a new opt-in branch must not change Fixed Real Spending
     behavior -- confirmed by the unchanged smoke-test regression pin, and
-    directly here for guardrails too."""
-    cfg = make_cfg(spending_strategy="guardrails")
+    directly here too."""
+    cfg = make_cfg(spending_strategy="fixed")
     _, df = rv.run_simulation(cfg)
     assert (df["VPW_Percentage"] == 0.0).all()
 
@@ -499,21 +363,6 @@ def test_max_expenses_is_a_no_op_for_fixed_spending():
     cfg = make_cfg(spending_strategy="fixed", base_annual_expenses=90_000, max_annual_expenses=90_000)
     _, df = rv.run_simulation(cfg)
     assert not df["Max_Expenses_Bound_Hit"].any()
-
-
-def test_max_expenses_caps_guardrail_prosperity_raises():
-    cfg = make_cfg(
-        planning_end_age=90, spending_strategy="guardrails",
-        guardrail_floor_pct=0.10, guardrail_ceiling_pct=3.0,  # let the % ceiling go high
-        max_annual_expenses=90_000,  # equal to plan -- any raise above it should be capped
-    )
-    num_years = cfg["planning_end_age"] - cfg["retirement_age"] + 1
-    overrides = {k: np.full(num_years, 0.35) for k in ["pretax", "roth", "hsa", "cash", "legacy_pool", "brokerage"]}
-    _, df = rv.run_simulation(cfg, return_overrides=overrides)
-    infl = cfg["inflation_rate"]
-    real_base_exp = df["Base_Expenses"] / (1 + infl) ** df["Years_Retired"]
-    assert real_base_exp.max() <= 90_000 + 1e-6
-    assert df["Max_Expenses_Bound_Hit"].any()
 
 
 def test_max_expenses_and_absolute_min_floor_both_respected():

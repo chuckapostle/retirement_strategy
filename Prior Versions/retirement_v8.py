@@ -1,163 +1,11 @@
 """
-Retirement Income and Tax Planning Simulator v9
+Retirement Income and Tax Planning Simulator v8
 ================================================
 With accumulation phase, Monte Carlo, and Excel export.
 
 Usage:
   pip install streamlit plotly pandas numpy openpyxl
-  streamlit run retirement_v9.py
-
-v15 cleanup (removed two unused features):
-1. Removed the "Dynamic Guardrails (Guyton-Klinger)" spending strategy --
-   guardrail_factor, its withdrawal-rate band/adjustment/floor/ceiling
-   config, the Inflation Rule, and the Guardrail_Factor/Inflation_Frozen
-   output columns are gone. Spending Strategy is now a two-way choice:
-   Fixed Real Spending or Variable Percentage Withdrawal (VPW, default).
-2. Removed the "Performance Draw Only" cash-draw option
-   (performance_draw_only cfg key and its sidebar checkbox) -- the cash
-   bucket's draw cap is now always the plain balance, same as every other
-   account.
-
-v14 fix (VPW was force-spending money nobody would actually consume):
-1. Traced why late-plan spending under VPW spikes while the estate
-collapses: VPW's withdrawal % is designed to amortize the portfolio to
-(near) zero by planning_end_age, so the % necessarily accelerates
-(clamped to 100% in the final year) as the horizon shrinks. But the
-model had no concept of "withdrew more than was actually spent" -- the
-full VPW-calculated amount always flowed into Base_Expenses/total_exp
-and was drawn from the accounts as though 100% of it were consumed,
-even in a large portfolio's final years where that could exceed a
-realistic budget entirely (verified: a large enough portfolio could
-even go temporarily insolvent once healthcare/HDHP/etc. stacked on top
-of a 100%-of-portfolio VPW draw).
-2. Added max_annual_expenses (today's $, UI default = your Annual
-Expenses figure): a hard ceiling on base spending, applied BEFORE
-total_exp/the draw waterfall are built, so anything above it simply
-stays invested instead of being withdrawn at all -- not
-drawn-then-unaccounted-for. Mirrors the existing
-absolute_min_annual_expenses floor structurally. Also caps Guardrails'
-Prosperity Rule upside; a no-op for Fixed Real Spending, which never
-exceeds its own planned amount. Off (0) by default at the engine level
-for direct API/test use.
-3. Bumped the default Plan Through Age (planning_end_age) from 89 to 95
--- at 89 it was fighting against VPW's now-default selection, forcing
-an aggressive drawdown-to-zero on a much shorter horizon than most
-plans should assume. Still user-adjustable.
-
-v13 enhancement (Variable Percentage Withdrawal -- new default strategy):
-  Added VPW as a third Spending Strategy option alongside Fixed Real
-  Spending and Dynamic Guardrails (Guyton-Klinger), and made it the
-  default. Each year, base spending is a percentage of the CURRENT total
-  portfolio balance, recalculated fresh via vpw_percentage() -- the
-  standard amortization formula (same math as an RMD divisor: draw a
-  balance earning an assumed real return to exactly zero over the
-  remaining years), with the percentage rising as the remaining horizon
-  shrinks. Popularized by the Bogleheads community specifically as an
-  alternative to fixed or step-adjusted withdrawal rules. Unlike
-  Guyton-Klinger's guardrail_factor, VPW has no persistent multiplier and
-  therefore no "stuck" state: a bad year changes next year's dollar
-  amount only because the portfolio shrank, and a full rebound restores
-  spending to parity immediately (verified directly: an offsetting
-  rebound the year after a -20% shock closes >98% of the gap by the
-  following year, vs. Guyton-Klinger's cuts which -- per the v11 finding
-  -- rarely reverse at all). The final simulated year is clamped to 100%
-  (the raw ordinary-annuity formula gives slightly over 100% at n=1,
-  which is meaningless as a share of a balance you actually have). Still
-  respects the Absolute Minimum Annual Expenses floor as a hard backstop,
-  same as the other two strategies. Purely additive: Fixed/Guardrails
-  behavior and the regression pin are unchanged.
-
-v12 default tuning (UI starting values, no engine/behavior changes):
-  Annual Cash Savings 150k->40k, Final Year Cash Lump 120k->0, Brokerage
-  Annual Contribution 0->200k, Fat-Tailed Returns off->on, Absolute
-  Minimum Annual Expenses 0->145k, Spending Strategy Fixed->Dynamic
-  Guardrails, Cumulative Spending Bound 90-150%->60-150%, Enable Roth
-  Conversions off->on. Every one of these remains user-adjustable in the
-  sidebar; only the value shown on first load changed.
-
-v11 fix (guardrail floor was not actually a floor):
-1. The v10 Inflation Rule applied via a separate, unbounded freeze on the
-spending base, independent of Guardrail_Factor's floor/ceiling clamp.
-Verified empirically: with the (then-)default 50% floor, among Monte
-Carlo paths that "succeeded" (portfolio > $0 at the final age), median
-real spending fell to ~40% of plan and as low as ~29% -- well past the
-floor -- while Guardrail_Factor itself still reported a compliant 50%,
-and MC success rate was inflated by roughly 30 percentage points versus
-the same run with the Inflation Rule off. Fixed by folding the Inflation
-Rule into Guardrail_Factor itself (a division by (1+infl) the year after
-a down year, same permanent-step mechanism as the withdrawal-rate rule)
-so BOTH rules share the same bounded number and the floor/ceiling clamp
-applies to their combined effect. Confirmed via direct re-run: real
-spending now bottoms out exactly at the configured floor, never below.
-2. Added an absolute_min_annual_expenses floor (today's $, config default
-0/off): a hard minimum on base spending, independent of what % the
-guardrail floor happens to allow -- 50% of a padded plan may still be
-generous, the same 50% of a tight one may not be livable. Applied after
-all other reductions (post-80, widowhood, guardrail cuts), so nothing
-can push spending below it once set.
-3. Added a spending-percentile chart and a "worst real spending among
-successful paths" metric to the Monte Carlo tab. Success rate alone
-(portfolio > $0) says nothing about how much spending was cut to get
-there; this makes the lifestyle experience behind a "success" visible
-instead of only the asset-survival outcome.
-4. Bumped the default Cumulative Spending Bound floor from 50% to 90% of
-plan (guardrail_floor_pct). Deliberately tight -- in a 14%-std-dev
-fat-tailed stress test this drops MC success rate from ~54% (at the
-old, now-honestly-bounded 50% floor) to ~7%, because a 90% floor leaves
-room for barely one adjustment step before it engages. That's an honest
-number, not a bug: it reflects how little the strategy can now deviate
-from Fixed Real Spending. Loosen it if you want more room for the
-strategy to actually flex.
-
-v10 enhancements (perf/caching + financial modeling, on top of v9):
-  1. Monte Carlo and the scenario optimizer no longer recompute the
-     (deterministic) accumulation phase on every single simulation --
-     hoisted out and computed once (or once per unique retirement_age for
-     the optimizer), a substantial speedup at high sim counts.
-  2. run_simulation/run_monte_carlo/run_optimizer are now cached across
-     Streamlit reruns (@st.cache_data), so moving a widget that doesn't
-     change the underlying scenario (e.g. the "Today's Dollars" display
-     toggle) no longer re-triggers a full Monte Carlo run. A seed of 0
-     ("random") is deliberately left uncached so it keeps drawing fresh
-     paths on every rerun, same as before.
-  3. New taxable brokerage account bucket: sits between Cash and Roth in
-     the draw order, tracks a running cost basis, realizes long-term
-     capital gains on withdrawal taxed via the IRS "stacked on top of
-     ordinary income" method (federal preferential rates; Oregon taxes it
-     as ordinary income, no LTCG preference), and gets a full basis
-     step-up at death like Roth/cash (unlike PreTax/HSA). Wired into
-     Monte Carlo correlation, sensitivity analysis, and Excel export.
-  4. Guyton-Klinger guardrails gained the "Inflation Rule": spending can
-     now also skip a year's COLA following a negative portfolio return,
-     alongside the existing capital-preservation/prosperity rules and the
-     v8 cumulative floor/ceiling.
-  5. Removed dead scaffolding that was computed but never used anywhere
-     (FPL_700/Under_700_FPL and several other never-populated columns
-     left over from an earlier version).
-  6. Fixed a stale hardcoded base_year=2024 (now CURRENT_YEAR, computed
-     live) -- cosmetic only (displayed Year column); tracing the math
-     confirms no tax/dollar calculation ever depended on the specific
-     value, since it always cancels out of the year-offset (yfb/yir) math.
-  7. Added TAX_YEAR + verify_tax_constants(): a runtime banner that warns
-     when nobody has re-verified the hardcoded federal/Oregon/LTCG
-     bracket and IRMAA figures against actual current-year IRS/SSA
-     numbers -- these are annually-adjusted figures baked in as of
-     TAX_YEAR and will silently go stale otherwise.
-  8. Added a pytest regression suite (tests/test_retirement_v9.py)
-     covering the RMD table, Social Security taxability tiers, the tax
-     engine, guardrail floor/ceiling, the new brokerage/LTCG math, the
-     Inflation Rule, and the tax-year verifier.
-
-v9 fix:
-1. "Discretionary Draw Reduction if Year Return < 0" was a fixed nominal
-dollar amount for the entire plan, while base_annual_expenses (and every
-other spending line) inflates every year. That meant the same-looking
-cut had a shrinking REAL bite over time -- 11.9% of base expenses in
-year 1 vs. 5.1% by year 30 in a typical scenario, worth less than half
-its original purchasing power. Now indexed to inflation like everything
-else: entered in today's dollars, scaled by (1+infl)**yir each year, so
-a bad year in year 1 and a bad year in year 30 get an equivalent real
-cut. UI label updated to "(today's $)" to make this explicit.
+  streamlit run retirement_v7.py
 
 v7 enhancements (financial modeling, on top of v6's correctness fixes):
   1. Cash/MM interest is now taxed annually as ordinary income (was
@@ -252,30 +100,14 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from typing import Dict, List, Tuple
 import io
-from datetime import date
+import os
 from pathlib import Path
 
 # ============================================================
 # CONSTANTS
 # ============================================================
-
-# Anchors the displayed "Year" column to the real current year. Purely
-# cosmetic -- all tax-timing math uses year-offsets (yfb/yir) from this
-# anchor, which cancel it out, so this never affects any dollar figure.
-CURRENT_YEAR = date.today().year
-
-# The year FEDERAL_BRACKETS, SINGLE_FEDERAL_BRACKETS, OREGON_BRACKETS,
-# LTCG_BRACKETS/SINGLE_LTCG_BRACKETS, IRMAA_MAGI_THRESHOLD*,
-# IRMAA_MONTHLY_SURCHARGE, and the UI's default standard_deduction were last
-# checked against actual IRS Rev. Proc. / SSA COLA figures. Unlike
-# CURRENT_YEAR, this does NOT auto-update -- it's a manual marker, bumped
-# only when someone has actually re-verified the numbers below. Every
-# *future* simulated year is already correctly inflated forward from
-# whatever's here via bracket_inflation/inflation_rate regardless of how
-# stale TAX_YEAR gets; what goes stale is the CURRENT-YEAR baseline every
-# projection is anchored to. See verify_tax_constants() below.
-TAX_YEAR = 2026
 
 RMD_TABLE = {
     72: 27.4, 73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9,
@@ -316,40 +148,6 @@ OREGON_BRACKETS = [
 # Oregon's single-vs-MFJ bracket differences are much smaller than federal's;
 # OREGON_BRACKETS is used for both filing statuses as a documented simplification.
 
-# Long-term capital gains brackets. Federal only -- Oregon has no
-# preferential capital-gains rate (gains are taxed as ordinary income under
-# OREGON_BRACKETS, same as everything else). Approximate current-law
-# figures; like the ordinary brackets above, these need an annual refresh
-# (see TAX_YEAR / verify_tax_constants below).
-LTCG_BRACKETS = [
-    (0.00, 96_700), (0.15, 600_050), (0.20, float("inf")),
-]
-SINGLE_LTCG_BRACKETS = [
-    (0.00, 48_350), (0.15, 533_400), (0.20, float("inf")),
-]
-
-def verify_tax_constants():
-    """Returns a warning string if nobody has bumped TAX_YEAR since the real
-    calendar rolled past it -- i.e. the CURRENT-year tax-law baseline this
-    whole projection is anchored to hasn't been checked against actual IRS/
-    SSA figures for the year we're actually in. Returns None when current.
-    A runtime nag, not a correctness guarantee: bumping TAX_YEAR without
-    actually updating the bracket constants below silences this without
-    fixing anything -- it only proves someone looked, not that the numbers
-    are right."""
-    current_year = date.today().year
-    if current_year <= TAX_YEAR:
-        return None
-    years_stale = current_year - TAX_YEAR
-    return (
-        f"Tax-law constants were last verified for {TAX_YEAR}, but it's now {current_year} "
-        f"({years_stale} year{'s' if years_stale != 1 else ''} stale). FEDERAL_BRACKETS, "
-        f"SINGLE_FEDERAL_BRACKETS, OREGON_BRACKETS, LTCG_BRACKETS/SINGLE_LTCG_BRACKETS, "
-        f"IRMAA_MAGI_THRESHOLD*, IRMAA_MONTHLY_SURCHARGE, and the default standard deduction "
-        f"are all annually-adjusted figures -- check them against the current year's IRS Rev. "
-        f"Proc. and SSA COLA announcement, then bump TAX_YEAR."
-    )
-
 # ============================================================
 # TAX ENGINE
 # ============================================================
@@ -362,23 +160,6 @@ def calc_tax(taxable, brackets, yrs, infl):
         band = max(0.0, min(taxable, ac) - prev)
         tax += band * rate; prev = ac
         if taxable <= ac: break
-    return tax
-
-def calc_ltcg_tax(gain, ordinary_taxable, ltcg_brackets, yrs, infl):
-    """Long-term capital gains tax under the IRS 'stacked on top of ordinary
-    income' method (the Qualified Dividends and Capital Gain Tax Worksheet):
-    the gain occupies bracket space starting where ordinary_taxable already
-    fills up to, using the LTCG bracket thresholds -- so other ordinary
-    income (e.g. a Roth conversion) stacked below it can push the gain into
-    a higher LTCG bracket, same as in real life."""
-    if gain <= 0: return 0.0
-    tax, prev = 0.0, 0.0
-    stack_top = ordinary_taxable + gain
-    for rate, ceil in ltcg_brackets:
-        ac = ceil * (1 + infl) ** yrs if ceil != float("inf") else float("inf")
-        band = max(0.0, min(stack_top, ac) - max(prev, ordinary_taxable))
-        tax += band * rate; prev = ac
-        if stack_top <= ac: break
     return tax
 
 def bracket_ceiling(brackets, target_rate, yrs, infl):
@@ -410,31 +191,6 @@ def get_rmd(bal, age, start):
     else:
         f = RMD_TABLE[min(RMD_TABLE)]  # shouldn't happen given the age < start guard above
     return bal / f if f > 0 else 0.0
-
-def vpw_percentage(age, planning_end_age, real_return):
-    """Variable Percentage Withdrawal: the fraction of the CURRENT portfolio
-    balance to spend this year, per the standard amortization formula (the
-    same math behind a mortgage payment or an RMD divisor) -- draw down a
-    balance earning `real_return` annually to exactly zero over the
-    remaining n years. Popularized by the Bogleheads community as an
-    alternative to fixed real spending: self-correcting every year by
-    construction (this year's % applies to whatever the portfolio actually
-    is, good or bad), so a bad year never leaves a permanent "stuck"
-    reduction. The percentage rises with age as the remaining horizon n
-    shrinks --
-    that's intentional, not a bug: less time left means a larger share of
-    what's left gets drawn each year."""
-    n = max(1, planning_end_age - age + 1)  # years remaining, inclusive of this one
-    if abs(real_return) < 1e-9:
-        pct = 1.0 / n
-    else:
-        pct = real_return / (1 - (1 + real_return) ** (-n))
-    # The ordinary-annuity formula above gives slightly MORE than 100% in the
-    # final year (n=1) for any positive real_return -- mathematically
-    # correct under an end-of-year-payment convention, but nonsensical as a
-    # withdrawal rate against a CURRENT balance (you can't spend more than
-    # you have). Clamp to 100%: the last year simply spends what's left.
-    return min(pct, 1.0)
 
 def _standardized_shock(n, rng, fat_tailed, t_df):
     """Mean-0, unit-variance shock series. Normal by default; Student-t gives
@@ -474,8 +230,6 @@ def build_mc_return_overrides(cfg, num_years, rng, std_dev, max_up, correlation=
         "hsa": (cfg["hsa_return"], std_dev, max_up),
         "legacy_pool": (cfg.get("legacy_pool_return", cfg["roth_return"]),
                          cfg.get("legacy_pool_std", std_dev), max_up),
-        "brokerage": (cfg.get("brokerage_return", cfg["roth_return"]),
-                       cfg.get("brokerage_std", std_dev), max_up),
     }
     ov = generate_correlated_returns(bucket_specs, num_years, rng, correlation, fat_tailed, t_df)
     # Cash/MM: much lower volatility, only lightly correlated with the
@@ -495,7 +249,6 @@ def load_starting_balances(path="starting_balances.txt"):
         "s_plus_5": None,
         "s_plus_10": None,
         "cash": None,
-        "brokerage": None,
     }
     if not Path(path).exists():
         return defaults, False
@@ -514,9 +267,6 @@ def load_starting_balances(path="starting_balances.txt"):
         "s10": "s_plus_10",
         "s_plus_10": "s_plus_10",
         "cash": "cash",
-        "brokerage": "brokerage",
-        "taxable": "brokerage",
-        "taxablebrokerage": "brokerage",
     }
     loaded = False
     try:
@@ -547,16 +297,10 @@ def run_accumulation(cfg):
     """Grow balances from current age to retirement with contributions."""
     cur_age = cfg["current_age"]
     ret_age = cfg["retirement_age"]
-    base_year = CURRENT_YEAR
+    base_year = 2024
     years = ret_age - cur_age
-    bk0 = float(cfg.get("brokerage", 0.0))
-    # Starting cost basis defaults to the starting balance (no embedded gain
-    # assumed at t=0) but is overridable for an account that already has
-    # unrealized gains today.
-    bk_basis0 = float(cfg.get("brokerage_basis", bk0))
     if years <= 0:
-        return ([], cfg["pretax_401k"], cfg["roth_ira"], cfg["hsa"], cfg["cash"],
-                cfg["s_plus_5yr"], cfg["s_plus_10yr"], bk0, bk_basis0)
+        return [], cfg["pretax_401k"], cfg["roth_ira"], cfg["hsa"], cfg["cash"], cfg["s_plus_5yr"], cfg["s_plus_10yr"]
 
     pt = float(cfg["pretax_401k"])
     ro = float(cfg["roth_ira"])
@@ -564,8 +308,6 @@ def run_accumulation(cfg):
     ca = float(cfg["cash"])
     s5 = float(cfg["s_plus_5yr"])
     s10 = float(cfg["s_plus_10yr"])
-    bk = bk0
-    bk_basis = bk_basis0
 
     # Annual contributions
     c_401k = cfg.get("contrib_401k", 24_500)
@@ -576,14 +318,12 @@ def run_accumulation(cfg):
     c_employer_match = cfg.get("contrib_employer_match", 18_000)
     c_cash_annual = cfg.get("contrib_cash_annual", 150_000)
     c_cash_final_lump = cfg.get("contrib_cash_final_lump", 120_000)
-    c_brokerage_annual = cfg.get("contrib_brokerage_annual", 0)
 
     # Growth rates (same as retirement performance assumptions)
     pr_pt = cfg["pretax_return"]
     pr_ro = cfg["roth_return"]
     pr_hs = cfg["hsa_return"]
     pr_ca = cfg["cash_return"]
-    pr_bk = cfg.get("brokerage_return", pr_ro)
 
     rows = []
     for i in range(years):
@@ -596,19 +336,15 @@ def run_accumulation(cfg):
             ro *= (1 + pr_ro)
             hs *= (1 + pr_hs)
             ca *= (1 + pr_ca)
-            bk *= (1 + pr_bk)  # basis is untouched by growth
             # S+ grows in deferred comp while employed
             s5 *= (1 + pr_pt)
             s10 *= (1 + pr_pt)
 
-        # Contributions (end of year) -- brokerage contributions add 1:1 to
-        # both balance and basis (no gain on money that was just contributed)
+        # Contributions (end of year)
         pt += c_401k + c_employer_match
         ro += c_roth401k + c_roth_ira * 2 + c_mega_backdoor  # 2x Roth IRA for MFJ
         hs += c_hsa
         ca += c_cash_annual
-        bk += c_brokerage_annual
-        bk_basis += c_brokerage_annual
 
         # Final year lump sum
         if i == years - 1:
@@ -618,26 +354,24 @@ def run_accumulation(cfg):
             "Phase": "Accumulation",
             "Age": age, "Year": yr,
             "PreTax_EOY": pt, "Roth_EOY": ro, "HSA_EOY": hs, "Cash_EOY": ca,
-            "Brokerage_EOY": bk, "Brokerage_Basis": bk_basis,
             "S_Plus_5yr": s5, "S_Plus_10yr": s10,
             "Contrib_PreTax": c_401k + c_employer_match,
             "Contrib_Roth": c_roth401k + c_roth_ira * 2 + c_mega_backdoor,
             "Contrib_HSA": c_hsa,
             "Contrib_Cash": c_cash_annual + (c_cash_final_lump if i == years - 1 else 0),
-            "Contrib_Brokerage": c_brokerage_annual,
-            "Total_Liquid_Assets": pt + ro + hs + ca + bk,
+            "Total_Liquid_Assets": pt + ro + hs + ca,
         })
 
-    return rows, pt, ro, hs, ca, s5, s10, bk, bk_basis
+    return rows, pt, ro, hs, ca, s5, s10
 
 
 # ============================================================
 # RETIREMENT SIMULATION ENGINE
 # ============================================================
 
-def run_simulation(cfg, return_overrides=None, accum_result=None):
+def run_simulation(cfg, return_overrides=None):
     results = []
-    base_year = CURRENT_YEAR
+    base_year = 2024
     ret_age = cfg["retirement_age"]
     cur_age = cfg["current_age"]
     end_age = cfg["planning_end_age"]
@@ -646,15 +380,8 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
     binfl = cfg["bracket_inflation"]
     num_years = end_age - ret_age + 1
 
-    # Accumulation phase is deterministic given cfg -- it never reads
-    # return_overrides -- so it's identical across every Monte Carlo path
-    # and across every optimizer combo that shares the same retirement_age.
-    # Callers that run many simulations against the same cfg can compute it
-    # once and pass it in via accum_result instead of recomputing it on
-    # every single call (run_monte_carlo, run_optimizer both do this).
-    if accum_result is None:
-        accum_result = run_accumulation(cfg)
-    accum_rows, pt, ro, hs, ca, s5_bal, s10_bal, bk, bk_basis = accum_result
+    # Run accumulation phase to get retirement-day balances
+    accum_rows, pt, ro, hs, ca, s5_bal, s10_bal = run_accumulation(cfg)
     cash_basis = float(accum_rows[-1].get("Cash_Basis", cfg["cash"])) if accum_rows else float(cfg["cash"])
 
     # S+ payout tracking
@@ -675,7 +402,15 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
     # Roth) so it (a) compounds on its own and can be charted, and (b) can
     # never be drawn back out by the household's own retirement withdrawals.
 
-    use_vpw = cfg.get("spending_strategy") == "vpw"
+    # Guyton-Klinger-style dynamic guardrails (optional alternative to fixed
+    # real spending). guardrail_factor is a persistent multiplier on base
+    # spending -- it only changes when last year's withdrawal rate breached a
+    # guardrail, and the change compounds forward (a permanent step, not a
+    # one-year blip), same as the real strategy.
+    use_guardrails = cfg.get("spending_strategy") == "guardrails"
+    guardrail_factor = 1.0
+    initial_wr = None
+    prev_wr = None
 
     for idx in range(num_years):
         age = ret_age + idx
@@ -692,9 +427,34 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         is_widowed = bool(cfg.get("model_widow_scenario", False)) and age > cfg.get("first_death_age", 999)
         row["Filing_Status"] = "Single (Widowed)" if is_widowed else "MFJ"
         fed_brackets_yr = SINGLE_FEDERAL_BRACKETS if is_widowed else FEDERAL_BRACKETS
-        ltcg_brackets_yr = SINGLE_LTCG_BRACKETS if is_widowed else LTCG_BRACKETS
         std_ded_multiplier = 0.5 if is_widowed else 1.0  # single standard deduction is ~half of MFJ's
         irmaa_threshold_base = IRMAA_MAGI_THRESHOLD_SINGLE if is_widowed else IRMAA_MAGI_THRESHOLD
+
+        # ── DYNAMIC GUARDRAILS (Guyton-Klinger style) ──
+        # Evaluated using LAST year's ending withdrawal rate (the portfolio
+        # condition known at the start of this year), before this year's
+        # spending is set -- same sequencing as the real strategy.
+        if use_guardrails and yir > 0 and initial_wr and prev_wr is not None:
+            band = cfg.get("guardrail_band_pct", 0.20)
+            adj = cfg.get("guardrail_adjustment_pct", 0.10)
+            # Floor/ceiling on the CUMULATIVE guardrail_factor -- v7 let this
+            # multiplier compound every consecutive breach year with no
+            # bound, so a sustained downturn (or a Monte Carlo tail path)
+            # could decay spending to an unrealistically small fraction of
+            # the original plan (e.g. 0.9**10 ~= 35%). Real Guyton-Klinger
+            # implementations bound the cumulative deviation from the
+            # starting spending level rather than letting cuts/raises stack
+            # indefinitely. Defaults: never below 50% or above 150% of the
+            # plan's original (uninflated) spending level.
+            guardrail_floor = cfg.get("guardrail_floor_pct", 0.50)
+            guardrail_ceiling = cfg.get("guardrail_ceiling_pct", 1.50)
+            upper, lower = initial_wr * (1 + band), initial_wr * (1 - band)
+            if prev_wr > upper:
+                guardrail_factor *= (1 - adj)   # portfolio stressed -- cut spending
+            elif 0 < prev_wr < lower:
+                guardrail_factor *= (1 + adj)   # portfolio well ahead -- give a raise
+            guardrail_factor = min(max(guardrail_factor, guardrail_floor), guardrail_ceiling)
+        row["Guardrail_Factor"] = guardrail_factor
 
         # ── GROWTH ──
         # "Depleted" is now evaluated live off the current balance every year,
@@ -706,11 +466,9 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
             r_pt, r_ro = return_overrides["pretax"][yir], return_overrides["roth"][yir]
             r_hs, r_ca = return_overrides["hsa"][yir], return_overrides["cash"][yir]
             r_lp = return_overrides["legacy_pool"][yir] if "legacy_pool" in return_overrides else r_ro
-            r_bk = return_overrides["brokerage"][yir] if "brokerage" in return_overrides else r_ro
         else:
             r_pt, r_ro, r_hs, r_ca = pr_pt, pr_ro, pr_hs, pr_ca
             r_lp = cfg.get("legacy_pool_return", pr_ro)
-            r_bk = cfg.get("brokerage_return", pr_ro)
 
         # Snapshot the pretax balance as of the *prior* year-end, before this
         # year's growth is applied — RMDs are legally based on the 12/31
@@ -725,13 +483,12 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
             if hs > 0: hs *= (1 + r_hs)
             if ca > CASH_DISTRESS_FLOOR: ca *= (1 + r_ca)
             if legacy_pool > 0: legacy_pool *= (1 + r_lp)
-            if bk > 0: bk *= (1 + r_bk)  # basis is untouched by growth
             row["Return_PreTax"], row["Return_Roth"] = r_pt, r_ro
             row["Return_HSA"], row["Return_Cash"] = r_hs, r_ca
-            row["Return_Legacy_Pool"], row["Return_Brokerage"] = r_lp, r_bk
+            row["Return_Legacy_Pool"] = r_lp
         else:
             row["Return_PreTax"] = row["Return_Roth"] = row["Return_HSA"] = row["Return_Cash"] = 0.0
-            row["Return_Legacy_Pool"] = row["Return_Brokerage"] = 0.0
+            row["Return_Legacy_Pool"] = 0.0
 
         # Cash/MM interest is taxable annually as ordinary income (a money
         # market fund doesn't defer tax the way an equity account's
@@ -779,24 +536,11 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
 
         # ── EXPENSES ──
         # Pure inflation-adjusted "Annual Expenses" figure, before ANY
-        # strategy-driven adjustment (post-80, widowhood, negative-return
-        # cut). Recorded for audit -- confirms every scenario, including
-        # bad-return years, starts from the correctly inflated baseline
-        # rather than some stale/un-inflated number.
-        if use_vpw:
-            # Bogleheads-style VPW: base spending is a percentage of the
-            # CURRENT total portfolio (post-growth, pre-draw balances
-            # already in scope here), recomputed fresh every year -- no
-            # inflation projection or persistent multiplier involved, since
-            # this year's nominal portfolio value already reflects
-            # everything (growth, inflation-driven asset prices) up to now.
-            total_liquid_pre_draw = pt + ro + hs + ca + bk
-            vpw_pct = vpw_percentage(age, cfg["planning_end_age"], cfg.get("vpw_real_return_pct", 0.04))
-            base_exp_inflated_only = total_liquid_pre_draw * vpw_pct
-            row["VPW_Percentage"] = vpw_pct
-        else:
-            base_exp_inflated_only = cfg["base_annual_expenses"] * (1 + infl) ** yir
-            row["VPW_Percentage"] = 0.0
+        # strategy-driven adjustment (post-80, widowhood, guardrails,
+        # negative-return cut). Recorded for audit -- confirms every
+        # scenario, including bad-return years, starts from the correctly
+        # inflated baseline rather than some stale/un-inflated number.
+        base_exp_inflated_only = cfg["base_annual_expenses"] * (1 + infl) ** yir
         base_exp = base_exp_inflated_only
         # Post-80 expense reduction (lifestyle slowdown)
         if age >= 80:
@@ -805,36 +549,14 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         # any post-80 reduction that also applies)
         if is_widowed:
             base_exp *= (1 - cfg.get("expense_reduction_widowhood", 0.0))
-        # Absolute survival floor: a hard minimum on base (discretionary/
-        # lifestyle) spending, in TODAY'S dollars, that no combination of
-        # the reductions above (post-80, widowhood) can push spending below.
-        # Off (0) by default; opt in with your own bare-minimum number.
-        abs_min = cfg.get("absolute_min_annual_expenses", 0.0)
-        abs_min_inflated = abs_min * (1 + infl) ** yir if abs_min > 0 else 0.0
-        row["Absolute_Min_Inflated"] = abs_min_inflated
-        row["Absolute_Min_Bound_Hit"] = bool(abs_min > 0 and base_exp < abs_min_inflated)
-        if abs_min > 0:
-            base_exp = max(base_exp, abs_min_inflated)
-        # Spending ceiling: a hard maximum on base spending, in TODAY'S
-        # dollars. Matters most for VPW, whose withdrawal percentage
-        # accelerates toward the plan's end (see vpw_percentage) and would
-        # otherwise force this year's ENTIRE calculated draw to be treated
-        # as spent -- the model has no separate concept of "withdrew more
-        # than I actually spent," so an unbounded VPW percentage in the
-        # final years both draws down the portfolio and inflates
-        # Base_Expenses to match, whether or not that much would really be
-        # consumed. Applied here, BEFORE total_exp/the draw waterfall are
-        # built below, so anything above the ceiling simply stays invested
-        # instead of being drawn at all -- not drawn-then-unaccounted-for.
-        # A no-op for Fixed Real Spending, which never exceeds its own
-        # planned amount. Off (0) by default at the engine level; the UI
-        # defaults it to your Annual Expenses figure.
-        max_exp = cfg.get("max_annual_expenses", 0.0)
-        max_exp_inflated = max_exp * (1 + infl) ** yir if max_exp > 0 else 0.0
-        row["Max_Annual_Expenses_Inflated"] = max_exp_inflated
-        row["Max_Expenses_Bound_Hit"] = bool(max_exp > 0 and base_exp > max_exp_inflated)
-        if max_exp > 0:
-            base_exp = min(base_exp, max_exp_inflated)
+        # Dynamic guardrails: a persistent step up/down based on the
+        # portfolio's trailing withdrawal rate (distinct from, and stacks
+        # with, the reductions above and the same-year bad-return cut below --
+        # this reacts to multi-year trajectory, those react to lifestyle age
+        # or a single bad year). guardrail_factor is now floored/ceilinged
+        # above so this can never collapse spending to an unrealistic level.
+        if use_guardrails:
+            base_exp *= guardrail_factor
         healthcare = (cfg["healthcare_pre_medicare"] if age < 65 else cfg["healthcare_post_medicare"]) * (1 + cfg["healthcare_inflation"]) ** yir
         hdhp = cfg["hdhp_annual"] * (1 + infl) ** yir if age < 65 else 0.0
         gifts = cfg["gifts_annual"] * (1 + infl) ** yir
@@ -869,13 +591,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         total_exp = base_exp + healthcare + hdhp + gifts + lump + legacy_funding_this_year
 
         if is_negative_return:
-            # v9: was a fixed nominal dollar amount for the whole plan while
-            # base_exp inflates every year, so the same-looking cut had a
-            # shrinking real bite over time (11.9% of base expenses in year 1
-            # down to 5.1% by year 30 in a typical scenario). The input is
-            # entered in today's dollars and now inflates alongside
-            # everything else it's meant to offset.
-            reduction = cfg.get("neg_ret_draw_reduction", 0.0) * (1 + infl) ** yir
+            reduction = cfg.get("neg_ret_draw_reduction", 0.0)
             # Cannot reduce expenses below 0, but total_exp should be large enough
             reduction_applied = min(reduction, total_exp)
             total_exp -= reduction_applied
@@ -896,7 +612,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         row["RMD"] = rmd
 
         # ── BRACKET-OPTIMIZED DRAW STRATEGY ──
-        ptd = rod = hsd = cad = bkd = 0.0
+        ptd = rod = hsd = cad = 0.0
         need = max(0.0, total_exp - passive)
         std_ded_est = cfg["standard_deduction"] * std_ded_multiplier * (1 + binfl) ** yfb
         base_taxable = jss_tax + rent_tax + sp_inc
@@ -909,7 +625,6 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         if is_rmd_phase:
             if pt > 0: ptd = min(rmd, pt); need = max(0.0, need - ptd)
             if need > 0 and ca > 0: d = min(need, ca); cad += d; need -= d
-            if need > 0 and bk > 0: d = min(need, bk); bkd += d; need -= d
             if need > 0 and ro > 0: d = min(need, ro); rod += d; need -= d
             if need > 0 and hs > 0: d = min(need, hs); hsd += d; need -= d
             row["Draw_Strategy"] = "RMD-Dominated"
@@ -917,45 +632,32 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
             if need > 0 and pt > 0:
                 d = min(need, pretax_room_12, pt); ptd += d; need -= d
             if need > 0 and ca > 0:
-                d = min(need, ca); cad += d; need -= d
-            if need > 0 and bk > 0: d = min(need, bk); bkd += d; need -= d
+                # Was always cfg's static average cash return (pr_ca), even
+                # inside Monte Carlo runs where the realized draw for this
+                # specific year is r_ca -- now uses the actual realized return.
+                mx = ca * r_ca if cfg["performance_draw_only"] else ca
+                d = min(need, max(0.0, mx)); cad += d; need -= d
             if need > 0 and ro > 0: d = min(need, ro); rod += d; need -= d
             if need > 0 and hs > 0: d = min(need, hs); hsd += d; need -= d
             row["Draw_Strategy"] = "Bracket-Optimized"
 
         if need > 0:
-            for nm, avail in [("pretax", pt-ptd), ("cash", ca-cad), ("brokerage", bk-bkd),
+            for nm, avail in [("pretax", pt-ptd), ("cash", ca-cad),
                                ("roth", ro-rod), ("hsa", hs-hsd)]:
                 if need <= 0: continue
                 d = min(need, max(0.0, avail))
                 if nm == "pretax": ptd += d
                 elif nm == "cash": cad += d
-                elif nm == "brokerage": bkd += d
                 elif nm == "roth": rod += d
                 elif nm == "hsa": hsd += d
                 need -= d
 
-        # Brokerage draws realize a pro-rated long-term capital gain off the
-        # account's running cost basis -- a simplification (no lot-level
-        # detail, no annual qualified-dividend distributions), but it
-        # captures the real economics: contributed dollars come back
-        # tax-free, growth comes back as a taxed gain. basis_removed is
-        # applied to bk_basis in UPDATE BALANCES below.
-        if bkd > 0 and bk > 0:
-            basis_fraction = min(1.0, bk_basis / bk)
-            brokerage_ltcg_gain = bkd * (1 - basis_fraction)
-            basis_removed = bkd - brokerage_ltcg_gain
-        else:
-            brokerage_ltcg_gain = 0.0
-            basis_removed = 0.0
-        row["Brokerage_LTCG_Gain"] = brokerage_ltcg_gain
-
         row["PreTax_Draw"], row["Roth_Draw"] = ptd, rod
-        row["HSA_Draw"], row["Cash_Draw"], row["Brokerage_Draw"] = hsd, cad, bkd
+        row["HSA_Draw"], row["Cash_Draw"] = hsd, cad
         row["RMD_Excess"] = max(0.0, rmd - (total_exp - passive)) if is_rmd_phase else 0.0
 
         # ── TAX ──
-        other_taxable = ptd + jss_tax + rent_tax + sp_inc + cash_interest_taxable + brokerage_ltcg_gain
+        other_taxable = ptd + jss_tax + rent_tax + sp_inc + cash_interest_taxable
         sst = ss_taxable_portion(ss_inc, other_taxable, single=is_widowed)
         gross_taxable = other_taxable + sst
         std_ded = cfg["standard_deduction"] * std_ded_multiplier * (1 + binfl) ** yfb
@@ -968,18 +670,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         item_ded = med_ded + hdhp
         best_ded = max(std_ded, item_ded)
         fed_taxable = max(0.0, gross_taxable - best_ded)
-        # Federal taxes long-term capital gains at preferential rates,
-        # "stacked on top of" ordinary income (IRS Qualified Dividends and
-        # Capital Gain Tax Worksheet method): ordinary_taxable is fed_taxable
-        # with the LTCG gain backed out, taxed at ordinary rates; the gain
-        # itself is taxed via ltcg_brackets_yr starting from that floor, so
-        # it can be pushed into a higher LTCG bracket by other income (e.g.
-        # a large Roth conversion), same as in real life. When there's no
-        # brokerage gain this reduces to the old calc_tax(fed_taxable, ...).
-        ordinary_taxable = max(0.0, fed_taxable - brokerage_ltcg_gain)
-        fed_tax_ordinary = calc_tax(ordinary_taxable, fed_brackets_yr, yfb, binfl)
-        fed_ltcg_tax = calc_ltcg_tax(brokerage_ltcg_gain, ordinary_taxable, ltcg_brackets_yr, yfb, binfl)
-        fed_tax = fed_tax_ordinary + fed_ltcg_tax
+        fed_tax = calc_tax(fed_taxable, fed_brackets_yr, yfb, binfl)
         # Oregon fully exempts Social Security. The only SS-related dollars
         # ever present in gross_taxable are `sst` (other_taxable has no raw
         # ss_inc term), so subtracting `sst` alone fully backs SS out of the
@@ -1002,6 +693,8 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         irmaa_cost = (IRMAA_MONTHLY_SURCHARGE * 12 * irmaa_people * (1 + infl) ** yfb) if irmaa_hit else 0.0
         row["MAGI"], row["IRMAA_Threshold"] = magi, irmaa_thr
         row["IRMAA_Hit"], row["IRMAA_Cost"] = irmaa_hit, irmaa_cost
+        fpl_700 = 7 * 20_440 * (1 + infl) ** yfb
+        row["FPL_700"], row["Under_700_FPL"] = fpl_700, magi < fpl_700
 
         # ── ROTH CONVERSION ──
         roth_conv_amt = roth_conv_tax = 0.0
@@ -1012,16 +705,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
                 conv_room = min(conv_room, max(0.0, irmaa_thr - magi))
             roth_conv_amt = min(conv_room, max(0.0, pt - ptd - cfg["roth_conversion_margin"]))
             if roth_conv_amt > 0:
-                # Conversion income is ordinary and stacks BELOW the LTCG
-                # gain (a bigger conversion can push existing gains into a
-                # higher LTCG bracket) -- recompute the full ordinary+LTCG
-                # stack with the conversion added rather than taxing it at a
-                # flat marginal ordinary rate, to capture that knock-on
-                # effect. Reduces to the old formula when there's no gain.
-                ord_with_conv = ordinary_taxable + roth_conv_amt
-                fed_tax_with_conv = (calc_tax(ord_with_conv, fed_brackets_yr, yfb, binfl)
-                                      + calc_ltcg_tax(brokerage_ltcg_gain, ord_with_conv, ltcg_brackets_yr, yfb, binfl))
-                fc = fed_tax_with_conv - fed_tax
+                fc = calc_tax(fed_taxable + roth_conv_amt, fed_brackets_yr, yfb, binfl) - fed_tax
                 if cfg["oregon_resident"]:
                     # Was a flat 9% guess, inconsistent with the marginal-bracket
                     # approach used for federal (and not matching any actual
@@ -1034,8 +718,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
 
         # ── UPDATE BALANCES ──
         pt -= (ptd + roth_conv_amt); ro -= rod; ro += roth_conv_amt; hs -= hsd; ca -= cad
-        bk -= bkd; bk_basis -= basis_removed
-        total_income = passive + ptd + rod + hsd + cad + bkd
+        total_income = passive + ptd + rod + hsd + cad
         surplus = total_income - total_exp - total_tax - roth_conv_tax - irmaa_cost
         ca += surplus
 
@@ -1106,8 +789,6 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         pt = max(0.0, pt)
         ro = max(0.0, ro)
         hs = max(0.0, hs)
-        bk = max(0.0, bk)
-        bk_basis = max(0.0, min(bk_basis, bk))  # basis can never exceed balance
         legacy_pool = max(0.0, legacy_pool)
         # Cash IS allowed to go negative -- it represents a genuine funding
         # shortfall (expenses the plan couldn't cover from any account).
@@ -1119,8 +800,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
 
         row["PreTax_EOY"], row["Roth_EOY"], row["HSA_EOY"] = pt, ro, hs
         row["Cash_EOY"] = ca
-        row["Brokerage_EOY"], row["Brokerage_Basis"] = bk, bk_basis
-        total_liquid = pt + ro + hs + ca + bk
+        total_liquid = pt + ro + hs + ca
         row["Total_Liquid_Assets"] = total_liquid  # parents' own spendable net worth (excludes gifted-away legacy_pool)
         row["Family_Net_Worth"] = total_liquid + legacy_pool  # includes money already gifted to the kids' Roths
         # "If death occurs at this age, what would each child actually
@@ -1145,30 +825,25 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         hsa_after_tax_to_heirs = hs * (1 - heir_rate)  # HSAs lose tax-free status entirely for non-spouse heirs
         row["Heir_Tax_On_PreTax"] = pt * heir_rate
         row["Heir_Tax_On_HSA"] = hs * heir_rate
-        # Brokerage gets a full step-up in cost basis at death (IRC S1014):
-        # heirs owe no tax on gains accrued before death, so -- like Roth
-        # and cash -- it passes at full value, not haircut by heir_rate.
-        after_tax_estate = pretax_after_tax_to_heirs + hsa_after_tax_to_heirs + ro + ca + bk
+        after_tax_estate = pretax_after_tax_to_heirs + hsa_after_tax_to_heirs + ro + ca
         row["After_Tax_Estate_At_Death"] = after_tax_estate
         row["After_Tax_Family_Net_Worth"] = after_tax_estate + legacy_pool  # legacy pool is Roth -- already tax-free
         row["After_Tax_Estate_Per_Child"] = (after_tax_estate / n_kids) if n_kids else 0.0
         row["After_Tax_Total_Inheritance_Per_Child"] = (row["After_Tax_Family_Net_Worth"] / n_kids) if n_kids else 0.0
 
         row["Total_Real"] = (total_liquid / (1 + infl) ** yir) if yir > 0 else total_liquid
-        # Today's-dollar view of actual lifestyle spending -- lets the
-        # Monte Carlo tab show what a "successful" path's spending
-        # experience actually looked like, not just whether the portfolio
-        # survived.
-        row["Base_Expenses_Real"] = (base_exp / (1 + infl) ** yir) if yir > 0 else base_exp
 
-        total_draws = ptd + rod + hsd + cad + bkd
+        total_draws = ptd + rod + hsd + cad
         row["Total_Draws"] = total_draws
         row["Withdrawal_Rate"] = total_draws / total_liquid if total_liquid > 0 else 0.0
+        if use_guardrails:
+            if yir == 0:
+                initial_wr = row["Withdrawal_Rate"]
+            prev_wr = row["Withdrawal_Rate"]
 
-        # br12_gross already computed above (same fed_brackets_yr/yfb/binfl
-        # this year) -- reused here instead of recomputing.
+        br12 = bracket_ceiling(fed_brackets_yr, 0.12, yfb, binfl)
         br22 = bracket_ceiling(fed_brackets_yr, 0.22, yfb, binfl)
-        row["Bracket_12_Ceiling"], row["Bracket_22_Ceiling"] = br12_gross, br22
+        row["Bracket_12_Ceiling"], row["Bracket_22_Ceiling"] = br12, br22
 
         results.append(row)
 
@@ -1182,13 +857,10 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
 def run_monte_carlo(cfg, n_sims, std_dev, max_up, seed=None, correlation=0.85, fat_tailed=False, t_df=5):
     rng = np.random.default_rng(seed)
     num_years = cfg["planning_end_age"] - cfg["retirement_age"] + 1
-    # Accumulation is identical across every path (see run_simulation) --
-    # compute it once instead of n_sims times.
-    accum_result = run_accumulation(cfg)
     all_runs = []
     for _ in range(n_sims):
         ov = build_mc_return_overrides(cfg, num_years, rng, std_dev, max_up, correlation, fat_tailed, t_df)
-        _, df = run_simulation(cfg, return_overrides=ov, accum_result=accum_result)
+        _, df = run_simulation(cfg, return_overrides=ov)
         all_runs.append(df)
     return all_runs
 
@@ -1224,15 +896,6 @@ def run_optimizer(base_cfg, mc_sims, mc_std, mc_max, mc_seed, correlation=0.85, 
     results = []
     total_combos = len(ret_ages) * len(ss_ages) * len(reductions)
 
-    # Accumulation only depends on retirement_age among the swept variables
-    # (ss_start_age/expense_reduction_post80 never touch it) -- compute it
-    # once per unique retirement_age instead of once per combo per sim
-    # (len(ret_ages) calls instead of up to total_combos * opt_sims).
-    accum_cache = {
-        ret_age: run_accumulation({**base_cfg, "retirement_age": ret_age})
-        for ret_age in ret_ages
-    }
-
     for ret_age in ret_ages:
         for ss_age in ss_ages:
             if ss_age < ret_age:
@@ -1252,7 +915,7 @@ def run_optimizer(base_cfg, mc_sims, mc_std, mc_max, mc_seed, correlation=0.85, 
 
                 for _ in range(opt_sims):
                     ov = build_mc_return_overrides(test_cfg, num_years, rng, mc_std, mc_max, correlation, fat_tailed, t_df)
-                    _, sim_df = run_simulation(test_cfg, return_overrides=ov, accum_result=accum_cache[ret_age])
+                    _, sim_df = run_simulation(test_cfg, return_overrides=ov)
                     last = sim_df.iloc[-1]
                     if last["Total_Liquid_Assets"] > 0:
                         survived += 1
@@ -1292,7 +955,6 @@ SENSITIVITY_VARS = [
     ("Roth Return", "roth_return", "additive", 0.015),
     ("HSA Return", "hsa_return", "additive", 0.015),
     ("Cash/MM Return", "cash_return", "additive", 0.01),
-    ("Brokerage Return", "brokerage_return", "additive", 0.015),
     ("General Inflation", "inflation_rate", "additive", 0.01),
     ("Healthcare Inflation", "healthcare_inflation", "additive", 0.02),
     ("Base Annual Expenses", "base_annual_expenses", "multiplicative", 0.15),
@@ -1396,8 +1058,6 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         ("S+ 5-Year", cfg["s_plus_5yr"]),
         ("S+ 10-Year", cfg["s_plus_10yr"]),
         ("Cash", cfg["cash"]),
-        ("Taxable Brokerage", cfg.get("brokerage", 0)),
-        ("Taxable Brokerage Cost Basis", cfg.get("brokerage_basis", cfg.get("brokerage", 0))),
         ("", ""),
         ("ANNUAL CONTRIBUTIONS (Working Years)", ""),
         ("401(k) Employee", cfg.get("contrib_401k", 24_500)),
@@ -1408,14 +1068,12 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         ("Employer Match", cfg.get("contrib_employer_match", 18_000)),
         ("Cash Savings", cfg.get("contrib_cash_annual", 150_000)),
         ("Final Year Cash Lump", cfg.get("contrib_cash_final_lump", 120_000)),
-        ("Taxable Brokerage Savings", cfg.get("contrib_brokerage_annual", 0)),
         ("", ""),
         ("PERFORMANCE", ""),
         ("PreTax Return", cfg["pretax_return"]),
         ("Roth Return", cfg["roth_return"]),
         ("HSA Return", cfg["hsa_return"]),
         ("Cash Return", cfg["cash_return"]),
-        ("Taxable Brokerage Return", cfg.get("brokerage_return", cfg["roth_return"])),
         ("", ""),
         ("INCOME SOURCES", ""),
         ("SS Start Age", cfg["ss_start_age"]),
@@ -1448,9 +1106,10 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         ("", ""),
         ("SPENDING STRATEGY (v7)", ""),
         ("Strategy", cfg.get("spending_strategy", "fixed")),
-        ("VPW Assumed Real Return", cfg.get("vpw_real_return_pct", "")),
-        ("Absolute Minimum Annual Expenses (today's $)", cfg.get("absolute_min_annual_expenses", 0)),
-        ("Max Annual Expenses (today's $)", cfg.get("max_annual_expenses", 0)),
+        ("Guardrail Band (\u00b1%)", cfg.get("guardrail_band_pct", "")),
+        ("Guardrail Spending Adjustment (%)", cfg.get("guardrail_adjustment_pct", "")),
+        ("Guardrail Floor (% of plan)", cfg.get("guardrail_floor_pct", "")),
+        ("Guardrail Ceiling (% of plan)", cfg.get("guardrail_ceiling_pct", "")),
         ("", ""),
         ("SURVIVING SPOUSE SCENARIO (v7)", ""),
         ("Model Surviving Spouse Scenario", cfg.get("model_widow_scenario", False)),
@@ -1477,9 +1136,7 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
     if accum_df is not None and len(accum_df) > 0:
         ws_acc = wb.create_sheet("Accumulation")
         acc_cols = ["Age", "Year", "Contrib_PreTax", "Contrib_Roth", "Contrib_HSA", "Contrib_Cash",
-                    "Contrib_Brokerage",
-                    "PreTax_EOY", "Roth_EOY", "HSA_EOY", "Cash_EOY", "Brokerage_EOY", "Brokerage_Basis",
-                    "S_Plus_5yr", "S_Plus_10yr",
+                    "PreTax_EOY", "Roth_EOY", "HSA_EOY", "Cash_EOY", "S_Plus_5yr", "S_Plus_10yr",
                     "Total_Liquid_Assets"]
         for c, col in enumerate(acc_cols, 1):
             ws_acc.cell(row=1, column=c, value=col.replace("_", " "))
@@ -1499,16 +1156,13 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         "Age", "Year", "Draw_Strategy", "Filing_Status",
         "SS_Income", "JSS_Income", "JSS_Taxable", "Rental_Income", "Rental_Taxable",
         "S_Plus_Income", "Passive_Income",
-        "Base_Expenses", "Base_Expenses_Real", "Healthcare_Cost", "HDHP", "Gifts", "Lump_Sum",
-        "Discretionary_Reduction", "VPW_Percentage",
-        "Absolute_Min_Inflated", "Absolute_Min_Bound_Hit",
-        "Max_Annual_Expenses_Inflated", "Max_Expenses_Bound_Hit",
-        "PreTax_Draw", "Roth_Draw", "Cash_Draw", "HSA_Draw", "Brokerage_Draw", "Total_Draws",
+        "Base_Expenses", "Healthcare_Cost", "HDHP", "Gifts", "Lump_Sum",
+        "Discretionary_Reduction", "Guardrail_Factor",
+        "PreTax_Draw", "Roth_Draw", "Cash_Draw", "HSA_Draw", "Total_Draws",
         "Total_Income", "Total_Expenses", "Total_Tax", "Surplus_Deficit",
-        "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool", "Return_Brokerage",
-        "PreTax_EOY", "Roth_EOY", "HSA_EOY", "Cash_EOY", "Brokerage_EOY", "Brokerage_Basis",
-        "Total_Liquid_Assets", "Total_Real",
-        "Cash_Interest_Taxable", "Brokerage_LTCG_Gain",
+        "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool",
+        "PreTax_EOY", "Roth_EOY", "HSA_EOY", "Cash_EOY", "Total_Liquid_Assets", "Total_Real",
+        "Cash_Interest_Taxable",
         "Gross_Taxable_Income", "Federal_Taxable_Income",
         "Standard_Deduction", "Itemized_Deduction", "Best_Deduction", "Deduction_Type",
         "Federal_Tax", "Oregon_Tax",
@@ -1529,10 +1183,9 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         ws_ret.cell(row=1, column=c, value=col.replace("_", " "))
     style_header(ws_ret, len(ret_cols))
 
-    pct_columns = {"Effective_Tax_Rate", "Withdrawal_Rate",
-                   "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool",
-                   "Return_Brokerage", "VPW_Percentage"}
-    bool_columns = {"IRMAA_Hit", "Bad_Return_Year", "Absolute_Min_Bound_Hit", "Max_Expenses_Bound_Hit"}
+    pct_columns = {"Effective_Tax_Rate", "Withdrawal_Rate", "Guardrail_Factor",
+                   "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash", "Return_Legacy_Pool"}
+    bool_columns = {"IRMAA_Hit", "Bad_Return_Year"}
     text_columns = {"Draw_Strategy", "Filing_Status", "Deduction_Type"}
     neg_fill = PatternFill("solid", fgColor="FFE0E0")
 
@@ -1567,7 +1220,6 @@ def export_to_excel(accum_df, retire_df, cfg, mc_runs=None):
         ("  Roth IRA", first["Roth_EOY"]),
         ("  HSA", first["HSA_EOY"]),
         ("  Cash", first["Cash_EOY"]),
-        ("  Taxable Brokerage", first.get("Brokerage_EOY", 0.0)),
         ("", ""),
         (f"Your Own Estate at Age {cfg['planning_end_age']}", last["Total_Liquid_Assets"]),
         ("Real Value (inflation-adjusted)", last["Total_Real"]),
@@ -1682,36 +1334,12 @@ def qp_float(name, default):
 
 def get_balance_source(file_balances):
     qp = st.query_params
-    web_keys = ["pretax", "roth", "hsa", "s5", "s10", "brokerage", "cash"]
+    web_keys = ["pretax", "roth", "hsa", "s5", "s10", "cash"]
     if any(str(qp.get(k, "")).strip() for k in web_keys):
         return "web fetch from Excel"
     if any(v is not None for v in file_balances.values()):
         return "using Starting_balances.txt"
     return "using defaults"
-
-
-# ── Cached wrappers ──
-# Streamlit reruns the whole script on every widget interaction, so without
-# caching, moving a slider that doesn't even affect `cfg` (e.g. the "Show in
-# Today's Dollars" display toggle) still re-triggers a full deterministic
-# run plus a full Monte Carlo of up to mc_sims paths. These wrappers key off
-# the actual arguments, so a rerun with an unchanged cfg is a cache hit.
-@st.cache_data(show_spinner=False)
-def cached_run_simulation(cfg):
-    return run_simulation(cfg)
-
-
-@st.cache_data(show_spinner="Running Monte Carlo simulation...")
-def cached_run_monte_carlo(cfg, n_sims, std_dev, max_up, seed, correlation, fat_tailed, t_df):
-    return run_monte_carlo(cfg, n_sims, std_dev, max_up, seed=seed,
-                            correlation=correlation, fat_tailed=fat_tailed, t_df=t_df)
-
-
-@st.cache_data(show_spinner=False)
-def cached_run_optimizer(cfg, mc_sims, mc_std, mc_max, mc_seed, correlation, fat_tailed, t_df):
-    return run_optimizer(cfg, mc_sims, mc_std, mc_max, mc_seed,
-                          correlation=correlation, fat_tailed=fat_tailed, t_df=t_df)
-
 
 def main():
     st.set_page_config(page_title="Retirement Income Planner", page_icon="\U0001F4CA",
@@ -1719,17 +1347,13 @@ def main():
     st.title("\U0001F3E6 Retirement Income & Tax Planning Simulator")
     st.caption("Accumulation + Retirement modeling with Monte Carlo and Excel export")
 
-    tax_staleness_warning = verify_tax_constants()
-    if tax_staleness_warning:
-        st.warning(tax_staleness_warning, icon="⚠️")
-
     with st.sidebar:
         st.header("\u2699\ufe0f Configuration")
 
         with st.expander("\U0001F464 Age & Timeline", expanded=True):
             current_age = st.number_input("Current Age", 45, 70, 55)
             retirement_age = st.slider("Retirement Age", 55, 63, 55)
-            planning_end = st.slider("Plan Through Age", 85, 100, 95)
+            planning_end = st.slider("Plan Through Age", 85, 100, 89)
 
         with st.expander("\U0001F5A4 Surviving Spouse Scenario"):
             st.caption("Models the 'widow's penalty': filing status switches from MFJ to Single the year after the first spouse's death, with smaller brackets/deduction, a partial Social Security survivor benefit, and (optionally) reduced pension and living costs.")
@@ -1757,7 +1381,6 @@ def main():
                 ("hsa_input", "hsa", file_balances["hsa"] if file_balances["hsa"] is not None else 130_000),
                 ("s5_input", "s5", file_balances["s_plus_5"] if file_balances["s_plus_5"] is not None else 300_000),
                 ("s10_input", "s10", file_balances["s_plus_10"] if file_balances["s_plus_10"] is not None else 400_000),
-                ("brokerage_input", "brokerage", file_balances["brokerage"] if file_balances["brokerage"] is not None else 0),
                 ("cash_input", "cash", file_balances["cash"] if file_balances["cash"] is not None else 745_000),
             ]
             for widget_key, param_name, fallback in balance_specs:
@@ -1771,13 +1394,6 @@ def main():
             hsa_bal = st.number_input("HSA ($)", 0, 500_000, step=10_000, format="%d", key="hsa_input")
             s5_bal = st.number_input("S+ 5-Year Payout ($)", 0, 2_000_000, step=25_000, format="%d", key="s5_input")
             s10_bal = st.number_input("S+ 10-Year Payout ($)", 0, 2_000_000, step=25_000, format="%d", key="s10_input")
-            brokerage_bal = st.number_input(
-                "Taxable Brokerage ($)", 0, 5_000_000, step=25_000, format="%d", key="brokerage_input",
-                help="A separate, non-tax-advantaged account. Contributed dollars come back "
-                     "tax-free; growth is taxed as a long-term capital gain when withdrawn. "
-                     "Sits between Cash and Roth in the draw order, and gets a full cost-basis "
-                     "step-up at death (unlike PreTax/HSA) -- see the Tax and Legacy tabs.",
-            )
             cash_bal = st.number_input("Cash ($)", 0, 1_000_000, step=10_000, format="%d", key="cash_input")
 
         with st.expander("\U0001F4BC Working Years Contributions"):
@@ -1789,25 +1405,14 @@ def main():
             c_mega = st.number_input("Mega Backdoor Roth ($)", 0, 50_000, 29_000, step=1_000, format="%d")
             c_match = st.number_input("Employer Match ($)", 0, 50_000, 18_000, step=1_000, format="%d")
             st.divider()
-            c_cash = st.number_input("Annual Cash Savings ($)", 0, 500_000, 40_000, step=5_000, format="%d")
-            c_cash_lump = st.number_input("Final Year Cash Lump ($)", 0, 500_000, 0, step=10_000, format="%d")
-            st.divider()
-            brokerage_basis_pct = st.slider(
-                "Brokerage Starting Cost Basis (% of balance)", 0, 100, 100, 5,
-                help="100% = no embedded gain today (e.g. a brand-new account or one "
-                     "you're funding from cash). Lower this if the account already "
-                     "holds unrealized gains.",
-            )
-            brokerage_basis = brokerage_bal * brokerage_basis_pct / 100
-            c_brokerage = st.number_input("Brokerage Annual Contribution ($)", 0, 200_000, 200_000, step=5_000, format="%d")
+            c_cash = st.number_input("Annual Cash Savings ($)", 0, 500_000, 150_000, step=5_000, format="%d")
+            c_cash_lump = st.number_input("Final Year Cash Lump ($)", 0, 500_000, 120_000, step=10_000, format="%d")
 
         with st.expander("\U0001F4C8 Performance Assumptions"):
             pretax_ret = st.slider("PreTax Target Return %", 0.0, 12.0, 6.0, 0.5) / 100
             roth_ret = st.slider("Roth Target Return %", 0.0, 12.0, 7.0, 0.5) / 100
             hsa_ret = st.slider("HSA Target Return %", 0.0, 12.0, 5.0, 0.5) / 100
             cash_ret = st.slider("Cash/MM Target Return %", 0.0, 8.0, 4.0, 0.25) / 100
-            brokerage_ret = st.slider("Brokerage Target Return %", 0.0, 12.0, 7.0, 0.5) / 100
-            brokerage_std_pct = st.slider("Brokerage Return Std Dev % (Monte Carlo)", 1.0, 25.0, 15.0, 0.5) / 100
 
         with st.expander("\U0001F3B2 Monte Carlo Settings"):
             mc_enabled = st.checkbox("Enable Monte Carlo", value=True)
@@ -1818,7 +1423,7 @@ def main():
             st.caption("PreTax/Roth/HSA/Legacy Pool move together each year (same market factor) instead of being drawn fully independently -- more realistic since they typically hold similar underlying investments.")
             mc_correlation = st.slider("Cross-Account Correlation", 0.0, 1.0, 0.85, 0.05,
                 help="1.0 = all equity-like accounts move in lockstep each year. 0.0 = fully independent (old behavior). Cash/MM always gets a smaller fraction of this (money-market rates track policy rates, not stocks).")
-            mc_fat_tailed = st.checkbox("Fat-Tailed Returns (Student-t)", value=True,
+            mc_fat_tailed = st.checkbox("Fat-Tailed Returns (Student-t)", value=False,
                 help="Real market returns crash harder and more often than a bell curve predicts. Enabling this uses a Student-t distribution instead of Normal, producing more realistic tail risk (more frequent extreme years) at the same target return and std dev.")
             mc_t_df = st.slider("Fat-Tail Intensity (lower = fatter tails)", 3, 15, 5, 1, disabled=not mc_fat_tailed) if mc_fat_tailed else 5
 
@@ -1847,57 +1452,24 @@ def main():
             exp_red_80 = st.slider("Expense Reduction After 80 (%)", 0, 25, 25, 5) / 100
             st.caption("Lifestyle slowdown: reduce base expenses after age 80.")
             st.subheader("Negative Return Adjustment")
-            neg_ret_reduction = st.number_input("Discretionary Draw Reduction if Year Return < 0 (today's $)", 0, 200_000, 20_000, step=1000, format="%d")
-            st.caption("Entered in today's dollars -- inflates every year alongside your base expenses, so a bad year in year 1 and a bad year in year 30 get an equivalent real cut.")
-            st.subheader("Absolute Survival Floor")
-            absolute_min_expenses = st.number_input(
-                "Absolute Minimum Annual Expenses (today's $)", 0, 200_000, 145_000, step=5_000, format="%d",
-                help="A hard floor on base spending that no reduction above -- post-80 slowdown "
-                     "or widowhood -- can push below, no matter how many bad years compound. "
-                     "0 = off (no absolute floor).",
-            )
-            st.subheader("Spending Ceiling")
-            max_annual_expenses = st.number_input(
-                "Max Annual Expenses (today's $)", 0, 500_000, int(base_exp), step=5_000, format="%d",
-                help="A hard ceiling on base spending. Matters most for VPW, whose withdrawal "
-                     "percentage accelerates near the end of the plan and would otherwise force-"
-                     "spend far more than a realistic budget in the final years -- anything above "
-                     "this ceiling simply stays invested instead of being withdrawn at all. A "
-                     "no-op for Fixed Real Spending, which never exceeds its own planned amount. "
-                     "Defaults to your Annual Expenses figure above. 0 = off (no ceiling).",
-            )
+            neg_ret_reduction = st.number_input("Discretionary Draw Reduction if Year Return < 0 ($)", 0, 200_000, 20_000, step=1000, format="%d")
             st.subheader("Spending Strategy")
-            spending_strategy_choice = st.radio(
-                "Strategy",
-                ["Fixed Real Spending", "Variable Percentage Withdrawal (VPW)"],
-                index=1,
-            )
-            if spending_strategy_choice.startswith("Variable"):
-                spending_strategy = "vpw"
-            else:
-                spending_strategy = "fixed"
-
-            # Default for when VPW's own input isn't shown below
-            vpw_real_return = 0.04
-
-            if spending_strategy == "vpw":
-                st.caption(
-                    "Spend a percentage of your CURRENT total portfolio balance each year, "
-                    "recalculated fresh annually -- the percentage itself rises with age (fewer "
-                    "expected remaining years), using the same amortization math as an RMD "
-                    "divisor. Self-correcting by construction: a bad year automatically reduces "
-                    "next year's dollar amount, a good year raises it. Popularized by the "
-                    "Bogleheads community as a simpler alternative to fixed withdrawals. The "
-                    "Absolute Minimum Annual Expenses floor above still applies on top as a "
-                    "hard backstop."
+            spending_strategy_choice = st.radio("Strategy", ["Fixed Real Spending", "Dynamic Guardrails (Guyton-Klinger)"], index=0)
+            spending_strategy = "guardrails" if spending_strategy_choice.startswith("Dynamic") else "fixed"
+            if spending_strategy == "guardrails":
+                st.caption("Spending steps down permanently if your withdrawal rate drifts too high above your starting rate, and steps up if it drifts too low -- instead of a fixed inflation-adjusted amount every year.")
+                guardrail_band_pct = st.slider("Guardrail Band (± % of starting withdrawal rate)", 5, 40, 20, 5) / 100
+                guardrail_adjustment_pct = st.slider("Spending Adjustment When Breached (%)", 5, 25, 10, 5) / 100
+                gr_floor_pct, gr_ceiling_pct = st.slider(
+                    "Cumulative Spending Bound (% of original plan)",
+                    30, 200, (50, 150), 5,
                 )
-                vpw_real_return = st.slider(
-                    "Assumed Real Return (%)", 0.0, 8.0, 4.0, 0.25,
-                    help="Expected long-run return net of inflation for your overall portfolio "
-                         "blend -- higher assumptions front-load more spending into earlier "
-                         "years. Typical published Bogleheads VPW tables use roughly 3-5% for a "
-                         "balanced (e.g. 60/40 stock/bond) portfolio.",
-                ) / 100
+                guardrail_floor_pct = gr_floor_pct / 100
+                guardrail_ceiling_pct = gr_ceiling_pct / 100
+                st.caption("Caps how far the cumulative guardrail adjustment can drift spending from your original plan, even after many consecutive stressed/flush years -- prevents unrealistic multi-year compounding down to a tiny fraction of your intended budget (or an unrealistically large raise on the upside).")
+            else:
+                guardrail_band_pct, guardrail_adjustment_pct = 0.20, 0.10
+                guardrail_floor_pct, guardrail_ceiling_pct = 0.50, 1.50
             st.subheader("Lump Sum")
             lump_age = st.number_input("Lump at Age", 55, 95, 70)
             lump_amt = st.number_input("Lump Amount ($)", 0, 1_000_000, 0, step=10_000, format="%d")
@@ -1909,8 +1481,9 @@ def main():
         with st.expander("\U0001F3AF Strategy", expanded=True):
             st.markdown("**PreTax→12% bracket, then Cash, then Roth. RMD dominates at 75+.**")
             rmd_start = st.slider("RMD Start Age", 73, 75, 75)
+            perf_only = st.checkbox("Performance Draw Only", value=False)
             st.divider()
-            roth_conv = st.checkbox("Enable Roth Conversions", value=True)
+            roth_conv = st.checkbox("Enable Roth Conversions", value=False)
             roth_bracket = st.selectbox("Conversion Target", ["12%", "22%"])
             roth_margin = st.number_input("Min PreTax Keep ($)", 0, 1_000_000, 100_000, step=25_000, format="%d")
             st.divider()
@@ -1942,13 +1515,10 @@ def main():
         current_age=current_age, retirement_age=retirement_age, planning_end_age=planning_end,
         pretax_401k=pretax, roth_ira=roth_bal, hsa=hsa_bal,
         s_plus_5yr=s5_bal, s_plus_10yr=s10_bal, cash=cash_bal,
-        brokerage=brokerage_bal, brokerage_basis=brokerage_basis,
         contrib_401k=c_401k, contrib_roth401k=c_roth401k, contrib_roth_ira=c_roth_ira,
         contrib_hsa=c_hsa, contrib_mega_backdoor=c_mega, contrib_employer_match=c_match,
         contrib_cash_annual=c_cash, contrib_cash_final_lump=c_cash_lump,
-        contrib_brokerage_annual=c_brokerage,
         pretax_return=pretax_ret, roth_return=roth_ret, hsa_return=hsa_ret, cash_return=cash_ret,
-        brokerage_return=brokerage_ret, brokerage_std=brokerage_std_pct,
         ss_start_age=ss_age, ss_annual_amount=ss_amount, ss_cola=ss_cola,
         jss_start_age=jss_age, jss_annual_amount=jss_amount, jss_cola=jss_cola_pct,
         jss_recovery_years=jss_recovery, rental_gross=rental, rental_taxable_pct=rental_tax_pct,
@@ -1959,40 +1529,30 @@ def main():
         gifts_annual=gifts, lump_sums=lump_sums,
         standard_deduction=std_ded, bracket_inflation=bracket_infl, oregon_resident=or_resident,
         tax_cash_interest=tax_cash_int,
-        rmd_start_age=rmd_start, draw_order=["pretax", "cash", "brokerage", "roth", "hsa"],
+        rmd_start_age=rmd_start, draw_order=["pretax", "cash", "roth", "hsa"],
         roth_conversion_enabled=roth_conv, roth_conversion_target_bracket=roth_bracket,
         roth_conversion_margin=roth_margin, irmaa_avoidance=irmaa_avoid,
+        performance_draw_only=perf_only,
         neg_ret_draw_reduction=neg_ret_reduction,
-        absolute_min_annual_expenses=absolute_min_expenses,
-        max_annual_expenses=max_annual_expenses,
         num_children=num_kids, roth_legacy_per_child=roth_per_child,
         legacy_years=legacy_years, legacy_inflation=inflation,
         legacy_pool_return=legacy_pool_ret, legacy_pool_std=legacy_pool_std_pct,
         heir_tax_rate=heir_tax_rate,
         spending_strategy=spending_strategy,
-        vpw_real_return_pct=vpw_real_return,
+        guardrail_band_pct=guardrail_band_pct, guardrail_adjustment_pct=guardrail_adjustment_pct,
+        guardrail_floor_pct=guardrail_floor_pct, guardrail_ceiling_pct=guardrail_ceiling_pct,
         model_widow_scenario=widow_scenario, first_death_age=first_death_age,
         ss_survivor_pct=ss_survivor_pct, jss_survivor_pct=jss_survivor_pct,
         expense_reduction_widowhood=exp_red_widow,
     )
 
     # ── RUN ──
-    accum_rows, df = cached_run_simulation(cfg)
+    accum_rows, df = run_simulation(cfg)
     accum_df = pd.DataFrame(accum_rows) if accum_rows else None
     mc_runs = None
     if mc_enabled:
-        if mc_seed > 0:
-            # A fixed seed makes the run fully deterministic given cfg, so
-            # it's safe -- and often the difference between an instant
-            # rerun and a multi-second one -- to cache.
-            mc_runs = cached_run_monte_carlo(cfg, mc_sims, mc_std, mc_max, mc_seed,
-                                              mc_correlation, mc_fat_tailed, mc_t_df)
-        else:
-            # Seed 0 means "random": each rerun should draw a genuinely new
-            # set of paths, same as before caching was added -- caching this
-            # would freeze the "random" run to whatever it first computed.
-            mc_runs = run_monte_carlo(cfg, mc_sims, mc_std, mc_max, seed=None,
-                                       correlation=mc_correlation, fat_tailed=mc_fat_tailed, t_df=mc_t_df)
+        mc_runs = run_monte_carlo(cfg, mc_sims, mc_std, mc_max, seed=mc_seed if mc_seed > 0 else None,
+                                   correlation=mc_correlation, fat_tailed=mc_fat_tailed, t_df=mc_t_df)
 
     # ── DEFLATOR (today's dollars conversion) ──
     # When show_real is True, deflate future dollar amounts back to present value
@@ -2015,13 +1575,10 @@ def main():
         df_disp["_deflate_yrs"] = accum_years + df_disp["Years_Retired"]
         money_cols = [c for c in df_disp.columns if c not in (
             "Age", "Year", "Years_Retired", "Phase", "Draw_Strategy",
-            "Effective_Tax_Rate", "Withdrawal_Rate",
-            "IRMAA_Hit", "Deduction_Type",
+            "Effective_Tax_Rate", "Withdrawal_Rate", "PreTax_WR",
+            "IRMAA_Hit", "Under_700_FPL", "In_12_Bracket", "In_22_Bracket",
+            "Deduction_Type", "PreTax_Depleted", "Roth_Depleted", "HSA_Depleted",
             "Return_PreTax", "Return_Roth", "Return_HSA", "Return_Cash",
-            "Return_Legacy_Pool", "Return_Brokerage", "VPW_Percentage",
-            # Already computed as real (today's-$) figures by the engine --
-            # deflating them again here would double-discount them.
-            "Total_Real", "Base_Expenses_Real",
             "RMD_Excess", "_deflate_yrs")]
         for c in money_cols:
             if c in df_disp.columns and df_disp[c].dtype in [np.float64, np.int64, float, int]:
@@ -2079,7 +1636,6 @@ def main():
             fig = go.Figure()
             for col, name, color in [("Cash_EOY","Cash","rgba(46,134,193,0.6)"),
                                      ("HSA_EOY","HSA","rgba(39,174,96,0.6)"),
-                                     ("Brokerage_EOY","Brokerage","rgba(230,126,34,0.6)"),
                                      ("Roth_EOY","Roth","rgba(142,68,173,0.6)"),
                                      ("PreTax_EOY","PreTax","rgba(231,76,60,0.6)")]:
                 fig.add_trace(go.Scatter(x=accum_df["Age"], y=accum_df[col], mode="lines", name=name,
@@ -2096,7 +1652,6 @@ def main():
     with tabs[ti]:
         fig = go.Figure()
         for col, name, color in [("Cash_EOY","Cash","rgba(46,134,193,0.6)"), ("HSA_EOY","HSA","rgba(39,174,96,0.6)"),
-                                 ("Brokerage_EOY","Brokerage","rgba(230,126,34,0.6)"),
                                  ("Roth_EOY","Roth","rgba(142,68,173,0.6)"), ("PreTax_EOY","PreTax","rgba(231,76,60,0.6)")]:
             fig.add_trace(go.Scatter(x=df_disp["Age"], y=df_disp[col], mode="lines", name=name,
                                      stackgroup="one", line=dict(width=0.5), fillcolor=color))
@@ -2316,23 +1871,8 @@ def main():
     if mc_runs:
         with tabs[ti]:
             surv = sum(1 for r in mc_runs if r.iloc[-1]["Total_Liquid_Assets"] > 0)
-            survived_runs = [r for r in mc_runs if r.iloc[-1]["Total_Liquid_Assets"] > 0]
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3 = st.columns(3)
             m1.metric("Sims", len(mc_runs)); m2.metric("Survived", surv); m3.metric("Rate", f"{surv/len(mc_runs)*100:.1f}%")
-            if survived_runs:
-                base0 = cfg["base_annual_expenses"]
-                worst_ratios = np.array([r["Base_Expenses_Real"].min() / base0 for r in survived_runs])
-                m4.metric("Worst Real Spending (median, successful paths)",
-                          f"{np.percentile(worst_ratios, 50) * 100:.0f}% of Annual Expenses target",
-                          help="Among the paths that 'succeeded' (portfolio > $0 at the final age), "
-                               "the median of each path's own lowest real (today's $) annual spending "
-                               "level, as a % of your Annual Expenses input. For Fixed Real Spending "
-                               "that input is the literal target the strategy tries to sustain; VPW "
-                               "has no fixed target at all (it deliberately floats with the "
-                               "portfolio), so here it's just a reference point, not a goal the "
-                               "strategy is failing to hit. A high success rate next to a low number "
-                               "here means the strategy is buying that survival by cutting your "
-                               "lifestyle, not the portfolio holding up.")
 
             bands = compute_percentile_bands(mc_runs, "Total_Liquid_Assets")
             ages = bands["Age"]
@@ -2348,34 +1888,6 @@ def main():
                                      line=dict(color="black", width=2, dash="dash")))
             fig.update_layout(title=f"MC Total Assets ({len(mc_runs)} runs)", yaxis_tickformat="$,.0f", height=500)
             st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("##### What did spending actually look like behind those numbers?")
-            bands_exp = compute_percentile_bands(mc_runs, "Base_Expenses_Real")
-            fig_exp = go.Figure()
-            fig_exp.add_trace(go.Scatter(x=np.concatenate([ages, ages[::-1]]),
-                y=np.concatenate([bands_exp["p95"], bands_exp["p5"][::-1]]),
-                fill="toself", fillcolor="rgba(231,76,60,0.1)", line=dict(color="rgba(255,255,255,0)"), name="5-95%"))
-            fig_exp.add_trace(go.Scatter(x=np.concatenate([ages, ages[::-1]]),
-                y=np.concatenate([bands_exp["p75"], bands_exp["p25"][::-1]]),
-                fill="toself", fillcolor="rgba(231,76,60,0.25)", line=dict(color="rgba(255,255,255,0)"), name="25-75%"))
-            fig_exp.add_trace(go.Scatter(x=ages, y=bands_exp["p50"], name="Median", line=dict(color="darkred", width=2)))
-            fig_exp.add_hline(y=cfg["base_annual_expenses"], line_dash="dash", line_color="black",
-                               annotation_text="Annual Expenses Target (today's $)")
-            fig_exp.update_layout(title="Actual Lifestyle Spending Across Simulations (Today's $)",
-                                  yaxis_tickformat="$,.0f", height=420)
-            st.plotly_chart(fig_exp, use_container_width=True)
-            st.caption(
-                "'Success' above only means the portfolio balance stayed above $0 at the final age -- "
-                "it says nothing about how much spending had to be cut to get there. This chart shows "
-                "the actual lifestyle spending (base expenses, today's dollars) each simulation lived "
-                "on, against your Annual Expenses input as a reference line (not a target VPW is "
-                "trying to hit -- it deliberately floats with the portfolio; the line is there so you "
-                "can judge the gap either way). If this band sags far below that line while the "
-                "success rate still looks good, the strategy is buying survival by cutting your "
-                "lifestyle, not because the portfolio actually held up -- consider setting an Absolute "
-                "Minimum Annual Expenses floor (Expenses tab), or a lower Max Annual Expenses ceiling "
-                "if the concern runs the other way and spending is instead being pushed too high."
-            )
 
             n_show = min(20, len(mc_runs))
             fig3 = go.Figure()
@@ -2399,8 +1911,8 @@ def main():
 
             if st.button("Run Optimizer", type="primary"):
                 with st.spinner("Running scenario sweep (this takes a moment)..."):
-                    opt_df = cached_run_optimizer(cfg, mc_sims, mc_std, mc_max, mc_seed,
-                                                   mc_correlation, mc_fat_tailed, mc_t_df)
+                    opt_df = run_optimizer(cfg, mc_sims, mc_std, mc_max, mc_seed,
+                                            correlation=mc_correlation, fat_tailed=mc_fat_tailed, t_df=mc_t_df)
 
                 # ── Current scenario baseline ──
                 surv = sum(1 for r in mc_runs if r.iloc[-1]["Total_Liquid_Assets"] > 0)
@@ -2471,7 +1983,6 @@ def main():
                 marker_color="rgba(99,110,250,0.6)",
                 text=[f"${lo:,.0f} \u2192 ${hi:,.0f}" for lo, hi in zip(sens_df["Low_Result"], sens_df["High_Result"])],
                 textposition="inside", insidetextanchor="middle",
-                textfont=dict(color="white"),
             ))
             fig.add_vline(x=base_final, line_dash="dash", line_color="black")
             fig.update_layout(
@@ -2506,9 +2017,8 @@ def main():
         st.caption(f"Displaying in **{dollar_label}**")
         dcols = ["Age","Year","Draw_Strategy",
                  "SS_Income","JSS_Income","Rental_Income","S_Plus_Income","Passive_Income",
-                 "Base_Expenses","Base_Expenses_Real","VPW_Percentage",
-                 "PreTax_Draw","Roth_Draw","Cash_Draw","Brokerage_Draw","HSA_Draw",
-                 "PreTax_EOY","Roth_EOY","HSA_EOY","Cash_EOY","Brokerage_EOY","Brokerage_LTCG_Gain",
+                 "PreTax_Draw","Roth_Draw","Cash_Draw","HSA_Draw",
+                 "PreTax_EOY","Roth_EOY","HSA_EOY","Cash_EOY",
                  "Total_Liquid_Assets","Family_Net_Worth","Total_Income","Total_Expenses","Total_Tax",
                  "Effective_Tax_Rate","Withdrawal_Rate","Surplus_Deficit",
                  "Roth_Conversion","RMD","RMD_Excess","IRMAA_Hit","Bad_Return_Year",
@@ -2519,10 +2029,10 @@ def main():
         avail = [c for c in dcols if c in df_disp.columns]
         show = st.multiselect("Columns", df_disp.columns.tolist(), default=avail)
         disp = df_disp[show].copy()
-        no_fmt = {"Age","Year","Years_Retired","Effective_Tax_Rate","Withdrawal_Rate",
-                  "IRMAA_Hit","Bad_Return_Year","Draw_Strategy","Absolute_Min_Bound_Hit","Max_Expenses_Bound_Hit",
-                  "Return_PreTax","Return_Roth","Return_HSA","Return_Cash","Phase"}
-        pct = {"Effective_Tax_Rate","Withdrawal_Rate","Return_PreTax","Return_Roth","Return_HSA","Return_Cash","VPW_Percentage"}
+        no_fmt = {"Age","Year","Years_Retired","Effective_Tax_Rate","Withdrawal_Rate","PreTax_WR",
+                  "IRMAA_Hit","Bad_Return_Year","Under_700_FPL","In_12_Bracket","In_22_Bracket","Draw_Strategy",
+                  "PreTax_Depleted","Roth_Depleted","HSA_Depleted","Return_PreTax","Return_Roth","Return_HSA","Return_Cash","Phase"}
+        pct = {"Effective_Tax_Rate","Withdrawal_Rate","PreTax_WR","Return_PreTax","Return_Roth","Return_HSA","Return_Cash"}
         fmt = {}
         for c in show:
             if c in pct: fmt[c] = "{:.1%}"
@@ -2557,13 +2067,9 @@ def main():
 
 **Surviving Spouse Scenario:** When enabled, filing status switches from MFJ to Single starting the year after the configured death age (the IRS allows MFJ in the year of death itself), pulling in single-filer federal brackets, a halved standard deduction, a halved IRMAA threshold, single Social Security taxability thresholds, and a configurable partial SS survivor benefit, pension survivor benefit, and living-expense reduction.
 
-**Spending Strategy:** Fixed Real Spending inflates your base expenses every year. Variable Percentage Withdrawal (VPW, default) instead spends a percentage of your CURRENT total portfolio balance every year -- recalculated fresh annually using the same amortization math as an RMD divisor, with the percentage rising as you age -- so it self-corrects immediately with portfolio performance instead of carrying forward a permanent step. Popularized by the Bogleheads community. Both still respect the Absolute Minimum Annual Expenses floor as a hard backstop.
-
-**Spending Ceiling:** A hard maximum on base spending, in today's dollars (defaults to your Annual Expenses figure). Matters most for VPW, whose withdrawal percentage accelerates toward the end of the plan -- without a ceiling, the model would draw down and "spend" whatever the raw percentage computes even in years nobody would realistically consume that much. Money above the ceiling simply stays invested rather than being withdrawn at all, so it isn't drawn-then-unaccounted-for. A no-op for Fixed Real Spending, which never exceeds its own planned amount.
+**Spending Strategy:** Fixed Real Spending (default) inflates your base expenses every year. Dynamic Guardrails (Guyton-Klinger style) instead compares last year's withdrawal rate to a band around your starting rate and applies a permanent step up/down in spending when breached.
 
 **Cash Shortfalls:** Cash is allowed to go negative to represent a genuine funding gap; it is not floored to $0, so Total_Liquid_Assets and Monte Carlo success rates reflect real shortfalls rather than hiding them.
-
-**Discretionary Reduction:** The "if Year Return < 0" cut is entered in today's dollars and inflates every year alongside base expenses, so it represents an equivalent real cut whether a bad year hits early or late in the plan.
 
 **Excel Export:** 4-sheet workbook: Assumptions, Accumulation, Retirement, Summary -- plus a 5th Monte Carlo sheet (percentile bands + success rate) whenever Monte Carlo is enabled.
         """)
