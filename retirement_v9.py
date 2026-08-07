@@ -681,7 +681,15 @@ def run_accumulation(cfg):
     """Grow balances from current age to retirement with contributions."""
     cur_age = cfg["current_age"]
     ret_age = cfg["retirement_age"]
-    base_year = CURRENT_YEAR
+    # base_year: the calendar year Current Age is measured AS OF (not
+    # necessarily today's literal date -- see the "Ages As Of Year" input).
+    # The full (retirement_age - current_age) gap is real, uninterrupted
+    # accumulation time starting from THIS year -- e.g. if today is most of
+    # the way through 2026 with no more contributions coming, set this to
+    # 2027 and enter Current Age as your age AS OF 2027, not today; the gap
+    # to Retirement Age then plays out entirely in 2027-onward, with no
+    # separate "dead year" bookkeeping needed here.
+    base_year = cfg.get("plan_base_year", CURRENT_YEAR)
     years = ret_age - cur_age
     bk0 = float(cfg.get("brokerage", 0.0))
     # Starting cost basis defaults to the starting balance (no embedded gain
@@ -771,10 +779,12 @@ def run_accumulation(cfg):
 
 def run_simulation(cfg, return_overrides=None, accum_result=None):
     results = []
-    base_year = CURRENT_YEAR
+    base_year = cfg.get("plan_base_year", CURRENT_YEAR)
     ret_age = cfg["retirement_age"]
     cur_age = cfg["current_age"]
     end_age = cfg["planning_end_age"]
+    # Must match run_accumulation: same base_year, same uninterrupted
+    # (ret_age - cur_age)-year gap starting from it.
     ret_year = base_year + (ret_age - cur_age)
     infl = cfg["inflation_rate"]
     binfl = cfg["bracket_inflation"]
@@ -1216,7 +1226,7 @@ def run_simulation(cfg, return_overrides=None, accum_result=None):
         # ── ROTH CONVERSION ──
         roth_conv_amt = roth_conv_tax = 0.0
         if cfg["roth_conversion_enabled"] and pt - ptd > cfg["roth_conversion_margin"]:
-            tgt = 0.12 if cfg["roth_conversion_target_bracket"] == "12%" else 0.22
+            tgt = {"12%": 0.12, "22%": 0.22, "24%": 0.24}.get(cfg["roth_conversion_target_bracket"], 0.22)
             conv_room = max(0.0, bracket_ceiling(fed_brackets_yr, tgt, yfb, binfl) - fed_taxable)
             if cfg["irmaa_avoidance"] and age >= 63:
                 conv_room = min(conv_room, max(0.0, irmaa_thr - magi_pre_conversion))
@@ -2078,8 +2088,19 @@ def main():
         st.header("\u2699\ufe0f Configuration")
 
         with st.expander("\U0001F464 Age & Timeline", expanded=True):
-            current_age = st.number_input("Current Age", 45, 70, 55)
-            retirement_age = st.slider("Retirement Age", 55, 63, 55)
+            current_age = st.number_input("Current Age", 45, 70, 55,
+                help=f"Your age today, unless the box below is checked -- then enter "
+                     f"your age as of {CURRENT_YEAR + 1} instead.")
+            skip_rest_of_this_year = st.checkbox(
+                f"No more contributions coming at age {current_age}", value=True,
+                help=f"When checked, {CURRENT_YEAR} contributes nothing further -- your "
+                     f"account balances below are treated as final for {CURRENT_YEAR}, "
+                     f"and the model's first full contribution year is {CURRENT_YEAR + 1}. "
+                     "Uncheck if you're using this earlier in the year and still expect "
+                     f"more {CURRENT_YEAR} contributions.",
+            )
+            plan_base_year = CURRENT_YEAR + 1 if skip_rest_of_this_year else CURRENT_YEAR
+            retirement_age = st.number_input("Retirement Age", 55, 63, 55, step=1)
             planning_end = st.slider("Plan Through Age", 85, 100, 95)
 
         with st.expander("\U0001F5A4 Surviving Spouse Scenario"):
@@ -2195,7 +2216,16 @@ def main():
 
         with st.expander("\U0001F4E5 Income Sources"):
             ss_age = st.slider("SS Start Age", 62, 70, 65)
-            ss_amount = st.number_input("SS Annual (Future $)", 0, 200_000, 78_000, step=1_000, format="%d")
+            ss_amount = st.number_input("SS Annual (Future $)", 0, 200_000, 106_000, step=1_000, format="%d")
+            ss_cut = st.checkbox("Apply 22% benefit cut (trust fund depletion)", value=False,
+                help="The SSA trustees project the OASI trust fund reserves are depleted "
+                     "around 2033, at which point incoming payroll tax revenue alone "
+                     "covers roughly 77-78% of scheduled benefits -- an automatic ~22% "
+                     "cut unless Congress acts before then. Off by default (assumes "
+                     "benefits are paid in full); check this to stress-test the plan "
+                     "against that scenario instead.")
+            if ss_cut:
+                ss_amount = round(ss_amount * 0.78)
             ss_cola = st.slider("SS COLA %", 0.0, 5.0, 2.0, 0.25) / 100
             st.divider()
             jss_age = st.slider("JSS Pension Start Age", 60, 70, 60)
@@ -2282,7 +2312,7 @@ def main():
             rmd_start = st.slider("RMD Start Age", 73, 75, 75)
             st.divider()
             roth_conv = st.checkbox("Enable Roth Conversions", value=True)
-            roth_bracket = st.selectbox("Conversion Target", ["12%", "22%"])
+            roth_bracket = st.selectbox("Conversion Target", ["12%", "22%", "24%"], index=1)
             roth_margin = st.number_input("Min PreTax Keep ($)", 0, 1_000_000, 100_000, step=25_000, format="%d")
             st.divider()
             irmaa_avoid = st.checkbox("IRMAA Avoidance", value=True)
@@ -2329,6 +2359,7 @@ def main():
     # ── BUILD CONFIG ──
     cfg = dict(
         current_age=current_age, retirement_age=retirement_age, planning_end_age=planning_end,
+        plan_base_year=plan_base_year,
         pretax_401k=pretax, roth_ira=roth_bal, hsa=hsa_bal,
         s_plus_5yr=s5_bal, s_plus_10yr=s10_bal, cash=cash_bal,
         brokerage=brokerage_bal, brokerage_basis=brokerage_basis,
@@ -2399,11 +2430,18 @@ def main():
         factors = (1 + inflation) ** year_col_or_yir
         return series_or_val / factors
 
+    # Real years of growth/contributions actually modeled before retirement
+    # starts -- read directly off the accumulation phase's own output
+    # (len(accum_rows)) rather than re-deriving it from current_age/
+    # retirement_age/plan_base_year a second time here. Two independent
+    # formulas computing the same thing drift apart the moment either one
+    # changes; this way there's exactly one, and it's also used below for the
+    # "At Retirement" KPI so that figure and the table agree.
+    accum_years = len(accum_rows) if accum_rows else 0
+
     # Build display-ready retirement df
     df_disp = df.copy()
     if show_real:
-        # Years from today (accumulation years + retirement years)
-        accum_years = max(0, retirement_age - current_age)
         df_disp["_deflate_yrs"] = accum_years + df_disp["Years_Retired"]
         money_cols = [c for c in df_disp.columns if c not in (
             "Age", "Year", "Years_Retired", "Phase", "Draw_Strategy",
@@ -2423,11 +2461,23 @@ def main():
     # ── KPI ROW ──
     c1, c2, c3, c4, c5 = st.columns(5)
     first, last = df_disp.iloc[0], df_disp.iloc[-1]
-    if accum_df is not None and len(accum_df) > 0:
-        c1.metric(f"Today's Assets", f"${accum_df.iloc[0]['Total_Liquid_Assets']:,.0f}")
-    else:
-        c1.metric("Starting Assets", f"${first['Total_Liquid_Assets']:,.0f}")
-    c2.metric(f"At Retirement ({dollar_label})", f"${first['Total_Liquid_Assets']:,.0f}")
+    # Raw entered balances, as-of today -- NOT accum_df.iloc[0], which (now
+    # that accumulation can start at plan_base_year rather than CURRENT_YEAR)
+    # already has a full year of contributions/growth baked in and would
+    # mislabel that as "today's."
+    today_assets = pretax + roth_bal + hsa_bal + cash_bal + brokerage_bal
+    c1.metric("Today's Assets", f"${today_assets:,.0f}")
+    # The moment retirement STARTS -- balance handed off from accumulation,
+    # before that first year's retirement spending/taxes are drawn (which is
+    # what df/df_disp's first row already reflects, further along than this).
+    # With no accumulation years modeled (e.g. retiring immediately), that
+    # handoff balance is just today's balance, unchanged -- so this and
+    # Today's Assets agree exactly, as expected, instead of differing by a
+    # year of spending that never actually happened.
+    at_retirement_nominal = (accum_df.iloc[-1]["Total_Liquid_Assets"]
+                              if accum_df is not None and len(accum_df) > 0 else today_assets)
+    at_retirement = deflate(at_retirement_nominal, accum_years)
+    c2.metric(f"At Retirement ({dollar_label})", f"${at_retirement:,.0f}")
     legacy_pool_last = last.get("Legacy_Pool_EOY", 0.0)
     c3.metric(f"Age {planning_end} ({dollar_label})", f"${last['Total_Liquid_Assets']:,.0f}",
               delta=(f"+${legacy_pool_last:,.0f} already gifted (see Legacy tab)" if legacy_pool_last > 0 else None),
@@ -2461,12 +2511,11 @@ def main():
     # ── Accumulation Tab ──
     with tabs[ti]:
         if accum_df is not None and len(accum_df) > 0:
-            yrs = retirement_age - current_age
             total_contrib = accum_df[["Contrib_PreTax", "Contrib_Roth", "Contrib_HSA", "Contrib_Cash"]].sum().sum()
             ac1, ac2, ac3 = st.columns(3)
-            ac1.metric("Working Years", f"{yrs}")
+            ac1.metric("Working Years", f"{accum_years}")
             ac2.metric("Total Contributions", f"${total_contrib:,.0f}")
-            ac3.metric("Retirement Day Assets", f"${first['Total_Liquid_Assets']:,.0f}")
+            ac3.metric("Retirement Day Assets", f"${at_retirement:,.0f}")
 
             fig = go.Figure()
             for col, name, color in [("Cash_EOY","Cash","rgba(46,134,193,0.6)"),
